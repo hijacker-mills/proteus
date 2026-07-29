@@ -79,6 +79,18 @@ TOOLS = [
         ["query"],
     ),
     _fn(
+        "youtube_search",
+        "Find the best educational YouTube videos for a study topic, so you can recommend "
+        "one (or a few) for the student to watch. Use when a concept is better learned by "
+        "watching (visual/procedural topics, worked examples, lectures). Returns videos with "
+        "title, channel, duration and views.",
+        {
+            "query": {"type": "string", "description": "What to find a teaching video about, e.g. 'binary search tree deletion explained'"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
+        },
+        ["query"],
+    ),
+    _fn(
         "memory_read",
         "Retrieve recent stored memories about the student (chronological). "
         "Use at session start to load context.",

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from .. import config
-from . import memory, proxy
+from . import memory, proxy, youtube
 
 Handler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -14,6 +14,7 @@ DISPATCH: dict[str, Handler] = {
     "quiz_generate": proxy.quiz_generate,
     "recall_grade": proxy.recall_grade,
     "image_search": proxy.image_search,
+    "youtube_search": youtube.youtube_search,
     "memory_read": memory.memory_read,
     "memory_write": memory.memory_write,
     "memory_search": memory.memory_search,

@@ -81,15 +81,22 @@ async def recall_grade(user_id: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def image_search(user_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Self-hosted IntelliQ image service (intelliq-image-search-go): a headless-Chrome
+    Google Images scraper. Returns {"images": [{id, src, alt, width, height, ...}]} —
+    the same SearchImage shape the IntelliQ web app uses. `src` is the canonical URL field.
+    """
     if not config.IMAGE_SEARCH_SERVICE_URL:
         return {"error": "image_search_not_configured"}
+    query = args.get("query", "")
+    count = int(args.get("count", 4))
     try:
         resp = await get_client().post(
             f"{config.IMAGE_SEARCH_SERVICE_URL}/search",
-            json={"query": args.get("query", ""), "count": int(args.get("count", 4))},
+            json={"query": query, "count": count},
             headers={"Authorization": f"Bearer {config.IMAGE_SEARCH_SERVICE_TOKEN}"},
+            timeout=45,  # headless-Chrome scrape can take ~10-30s cold
         )
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        return {"error": str(exc)}
+        return {"error": f"image service unavailable: {exc}"}

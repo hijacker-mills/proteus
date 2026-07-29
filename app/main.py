@@ -24,7 +24,7 @@ from typing import Any, AsyncGenerator
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import agent, channels, config, cron, db, httpclient, memory, redisc
+from . import agent, channels, config, cron, db, httpclient, memory, modes, redisc
 
 _USER_RE = re.compile(r"user_id:\s*([^\s]+)", re.IGNORECASE)
 
@@ -91,6 +91,17 @@ def _resolve_profile(body: dict[str, Any], header_profile: str | None) -> str | 
     return None
 
 
+def _resolve_mode(body: dict[str, Any], header_mode: str | None) -> str | None:
+    """Study mode (simple/exam/teachback). X-Qubi-Mode header wins, else body.mode.
+    Absent → no mode block injected (channels / legacy callers unchanged)."""
+    if header_mode and header_mode.strip():
+        return header_mode.strip()
+    m = body.get("mode")
+    if isinstance(m, str) and m.strip():
+        return m.strip()
+    return None
+
+
 def _chunk(chat_id: str, created: int, *, delta: dict | None = None,
            finish: str | None = None, tool_event: dict | None = None) -> str:
     payload: dict[str, Any] = {
@@ -105,11 +116,12 @@ def _chunk(chat_id: str, created: int, *, delta: dict | None = None,
     return f"data: {json.dumps(payload)}\n\n"
 
 
-async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None) -> AsyncGenerator[str, None]:
+async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
+               extra_system: str = "") -> AsyncGenerator[str, None]:
     chat_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     yield _chunk(chat_id, created, delta={"role": "assistant"})
-    async for ev in agent.run(user_id, body.get("messages", []), profile=profile):
+    async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system, profile=profile):
         if ev["type"] == "text":
             yield _chunk(chat_id, created, delta={"content": ev["text"]})
         elif ev["type"] == "tool":
@@ -124,13 +136,14 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None) -
     yield "data: [DONE]\n\n"
 
 
-async def _collect(user_id: str, body: dict[str, Any], profile: str | None = None) -> JSONResponse:
+async def _collect(user_id: str, body: dict[str, Any], profile: str | None = None,
+                   extra_system: str = "") -> JSONResponse:
     chat_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     text_parts: list[str] = []
     tool_events: list[dict] = []
     error: str | None = None
-    async for ev in agent.run(user_id, body.get("messages", []), profile=profile):
+    async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system, profile=profile):
         if ev["type"] == "text":
             text_parts.append(ev["text"])
         elif ev["type"] == "tool":
@@ -161,6 +174,7 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
     x_qubi_user_id: str | None = Header(default=None),
     x_acag_profile: str | None = Header(default=None),
+    x_qubi_mode: str | None = Header(default=None),
 ):
     _check_auth(authorization)
     try:
@@ -174,10 +188,12 @@ async def chat_completions(
 
     # Profile selects persona + toolset (header / body.profile / session_key prefix).
     profile = _resolve_profile(body, x_acag_profile)
+    # Study mode (simple/exam/teachback) is injected as an extra system block; absent → none.
+    extra_system = modes.block_for(_resolve_mode(body, x_qubi_mode))
 
     if body.get("stream"):
         return StreamingResponse(
-            _sse(user_id, body, profile),
+            _sse(user_id, body, profile, extra_system),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -185,7 +201,7 @@ async def chat_completions(
                 "X-Accel-Buffering": "no",  # disable nginx buffering for SSE
             },
         )
-    return await _collect(user_id, body, profile)
+    return await _collect(user_id, body, profile, extra_system)
 
 
 @app.get("/v1/models")

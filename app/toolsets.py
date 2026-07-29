@@ -30,6 +30,13 @@ def _provider(name: str) -> tuple[list[dict], DispatchFn] | None:
     if name == "agent":
         from .tools import agent_toolset
         return agent_toolset.TOOLS, agent_toolset.dispatch
+    if name == "web":
+        # Safe research subset of the agent toolset (no host access: no shell/run_code/email).
+        # Suitable for public profiles like Qubi.
+        from .tools import agent_toolset
+        keep = {"web_search", "web_fetch", "browser"}
+        tools = [t for t in (agent_toolset.TOOLS or []) if t["function"]["name"] in keep]
+        return tools, agent_toolset.dispatch
     return None
 
 

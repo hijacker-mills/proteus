@@ -19,6 +19,33 @@ from . import config
 from .redisc import get_redis
 
 
+def _render_payload(tool: str, result: Any) -> dict[str, Any] | None:
+    """A small, client-renderable slice of a tool result — allowlisted per tool.
+
+    Only tools whose entire output is meant to be shown wholesale opt in, so the
+    frontend can render a card directly from real data instead of depending on the
+    model to re-emit it as text markers. Kept tiny (SSE size + privacy): tools whose
+    useful output is the model's own prose (quiz_generate, lecture_evidence,
+    recall_grade, memory_*) are intentionally NOT included.
+    """
+    if not isinstance(result, dict):
+        return None
+    if tool == "image_search":
+        imgs = result.get("images")
+        if not isinstance(imgs, list):
+            return None
+        cards: list[dict[str, Any]] = []
+        for im in imgs[:6]:
+            if not isinstance(im, dict):
+                continue
+            src = im.get("src") or im.get("url")
+            if not src:
+                continue
+            cards.append({"src": str(src), "alt": str(im.get("alt") or "")[:200]})
+        return {"images": cards} if cards else None
+    return None
+
+
 def make_event(
     user_id: str,
     tool: str,
@@ -53,6 +80,14 @@ def make_event(
                 if isinstance(result.get(key), list):
                     ev["hits"] = len(result[key])
                     break
+
+    # Structured render payload for tools with a frontend card (image_search).
+    # Rides along on the same `qubi_tool_event` chunk; telemetry fields above
+    # are unchanged, so existing consumers keep working.
+    if status == "ok":
+        data = _render_payload(tool, result)
+        if data is not None:
+            ev["data"] = data
     return ev
 
 
