@@ -15,11 +15,17 @@ jobs:
     # A clean runner is the point. Everything below was previously only ever
     # proven on one developer's box, where the venv, Postgres, Redis and
     # Chromium already existed.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python: ["3.11", "3.12", "3.13"]
+        include:
+          # macOS on one version only: it catches path and asyncio differences
+          # without tripling the matrix for a platform most deployments are not.
+          - os: macos-latest
+            python: "3.12"
 
     steps:
       - uses: actions/checkout@v4

@@ -117,8 +117,13 @@ METRICS_PUBLIC = os.environ.get("METRICS_PUBLIC", "false").lower() in ("1", "tru
 # chat rather than refuse to import. Requiring it here contradicted both db.py
 # and the README, and made a fresh install crash before it could say why.
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-DB_POOL_MIN = _int("DB_POOL_MIN", 2)
-DB_POOL_MAX = _int("DB_POOL_MAX", 20)
+# Pool size PER WORKER, so a box holds DB_POOL_MAX x WORKERS connections and a
+# default Postgres (max_connections=100) fits about two boxes at 20x4. That
+# ceiling was set for a gateway whose request path used the database; this one's
+# does not. The pool now serves only memory, channels and cron, which are far
+# lower volume, so a small pool is right and the replica headroom is worth more.
+DB_POOL_MIN = _int("DB_POOL_MIN", 1)
+DB_POOL_MAX = _int("DB_POOL_MAX", 5)
 
 # Embeddings
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")

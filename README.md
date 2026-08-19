@@ -852,6 +852,12 @@ rather than silent.
   429s for everyone, including users already mid-answer. Watch `concurrency` on
   `/healthz`: `in_use` near `limit` means add capacity, and a climbing
   `rejected` means you needed to already.
+- **Connections are the replica ceiling.** A box holds `DB_POOL_MAX × WORKERS`
+  connections, so the defaults (5 × 4 = 20) fit about four boxes into a stock
+  `max_connections=100`, before whatever else shares that database. The old
+  default of 20 fit two. Chat never touches Postgres, so the pool only carries
+  memory, channels and cron: keep it small and spend the connections on
+  replicas. A pure-chat replica can run with `DATABASE_URL` unset and use none.
 - **Postgres:** if your provider offers a pooled endpoint, use it. Each worker
   keeps its own asyncpg pool; `statement_cache_size=0` is mandatory under
   PgBouncer transaction pooling (already set in `db.py`) or queries fail randomly
