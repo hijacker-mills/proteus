@@ -1,427 +1,440 @@
-"""proteus CLI — agents, tools, and a running gateway."""
+"""proteus CLI — many agents, one gateway."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
 import sys
-from pathlib import Path
+import time
 
 import typer
-from rich.console import Console
-from rich.table import Table
 
-app = typer.Typer(no_args_is_help=True, add_completion=False,
-                  help="Many agents, one gateway. Manage proteus agents, tools and a running instance.")
-agent_app = typer.Typer(no_args_is_help=True, help="Create and inspect agents.")
-tool_app = typer.Typer(no_args_is_help=True, help="Create and test tools.")
-app.add_typer(agent_app, name="agent")
-app.add_typer(tool_app, name="tool")
+from . import agents as agents_cmd
+from . import tools_cmd
+from ._common import (REPO, api_key, base_url, die, emit, err, get_json,
+                      load_env, out, table, try_json, version)
 
-con = Console()
-REPO = Path(__file__).resolve().parent.parent.parent
-
-
-def _load_env() -> None:
-    """Load .env with python-dotenv — the SAME loader app/config.py uses.
-
-    Hand-rolling this is a trap: a line like `TOOLS_SHELL=true  # locked down`
-    parses to the string "true  # locked down" under a naive split, which is
-    truthy-looking but fails every `== "true"` check, so the CLI silently
-    reports a different toolset than the server actually serves.
-    """
-    from dotenv import load_dotenv
-    load_dotenv(REPO / ".env")
+app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=True,          # `proteus --install-completion` comes free
+    help="Many agents, one gateway. Manage proteus agents, tools and a running instance.",
+)
+app.add_typer(agents_cmd.app, name="agent")
+app.add_typer(tools_cmd.app, name="tool")
 
 
-def _base(remote: str | None) -> str:
-    return (remote or f"http://127.0.0.1:{os.environ.get('PORT', '18791')}").rstrip("/")
+def _version_cb(value: bool) -> None:
+    if value:
+        out.print(f"proteus {version()}", highlight=False)
+        raise typer.Exit()
 
 
-def _get(url: str) -> dict:
-    import httpx
-    r = httpx.get(url, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-# ── agents ───────────────────────────────────────────────────────────────────
-
-@agent_app.command("list")
-def agent_list() -> None:
-    """Show every defined agent and where it came from."""
-    _load_env()
-    from app import agents_store
-    agents = agents_store.store().all()
-    if not agents:
-        con.print("[yellow]No agents defined.[/] Create one with `proteus agent new <name>`.")
-        raise typer.Exit(0)
-    t = Table("name", "toolset", "prompt", "source", "description", box=None, pad_edge=False)
-    for name, a in sorted(agents.items()):
-        t.add_row(f"[bold]{name}[/]", a.toolset or "none",
-                  f"{len(a.prompt)} ch", a.source, (a.description or "")[:52])
-    con.print(t)
-
-
-@agent_app.command("show")
-def agent_show(name: str, prompt: bool = typer.Option(False, "--prompt", help="Print the full prompt.")) -> None:
-    """Show one agent's configuration, and optionally its whole prompt."""
-    _load_env()
-    from app import agents_store, toolsets
-    a = agents_store.store().get(name)
-    if a is None:
-        con.print(f"[red]No agent named {name!r}.[/] Known: {', '.join(sorted(agents_store.store().all())) or 'none'}")
-        raise typer.Exit(1)
-    tools, _ = toolsets.load_for(a.toolset)
-    con.print(f"[bold]{a.name}[/]  [dim]{a.source}[/]")
-    con.print(f"  description : {a.description or '-'}")
-    con.print(f"  toolset     : {a.toolset or 'none'}  "
-              f"({len(tools or [])} tools: {', '.join(t['function']['name'] for t in (tools or [])) or '-'})")
-    con.print(f"  model       : {a.model or 'inherit MODEL'}")
-    con.print(f"  prompt      : {len(a.prompt)} chars (~{len(a.prompt)//4} tokens)")
-    if a.extra:
-        con.print(f"  extra       : {a.extra}")
-    if prompt:
-        con.print("\n[dim]---[/]\n" + a.prompt)
-
-
-_AGENT_TEMPLATE = """---
-name: {name}
-description: {description}
-toolset: [{toolset}]
----
-
-You are {name}, a helpful assistant.
-
-Replace this with the agent's real persona. Everything below the frontmatter is
-sent to the model as the system prompt, so write it as prose, not config.
-"""
-
-
-@agent_app.command("new")
-def agent_new(
-    name: str,
-    toolset: str = typer.Option("none", "--toolset", help="Comma list: none, web, agent, custom"),
-    description: str = typer.Option("", "--description"),
+@app.callback()
+def _root(
+    _v: bool = typer.Option(False, "--version", "-V", callback=_version_cb, is_eager=True,
+                            help="Show the version and exit."),
 ) -> None:
-    """Create agents/<name>.md."""
-    _load_env()
-    from app import agents_store
-    path = agents_store.AGENTS_DIR / f"{name}.md"
-    if path.exists():
-        con.print(f"[red]{path} already exists.[/]")
-        raise typer.Exit(1)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_AGENT_TEMPLATE.format(
-        name=name, description=description or f"The {name} agent",
-        toolset=", ".join(t.strip() for t in toolset.split(",") if t.strip()) or "none",
-    ), encoding="utf-8")
-    con.print(f"[green]created[/] {path}")
-    con.print("Edit the body to set its persona. The gateway picks it up without a restart.")
-
-
-@agent_app.command("edit")
-def agent_edit(name: str) -> None:
-    """Open agents/<name>.md in $EDITOR."""
-    _load_env()
-    from app import agents_store
-    path = agents_store.AGENTS_DIR / f"{name}.md"
-    if not path.exists():
-        con.print(f"[red]{path} does not exist.[/] Create it with `proteus agent new {name}`.")
-        raise typer.Exit(1)
-    subprocess.call([os.environ.get("EDITOR", "nano"), str(path)])
-
-
-@agent_app.command("rm")
-def agent_rm(name: str, yes: bool = typer.Option(False, "--yes", "-y")) -> None:
-    """Delete agents/<name>.md."""
-    _load_env()
-    from app import agents_store
-    path = agents_store.AGENTS_DIR / f"{name}.md"
-    if not path.exists():
-        con.print(f"[red]{path} does not exist.[/]")
-        raise typer.Exit(1)
-    if not yes and not typer.confirm(f"Delete {path}?"):
-        raise typer.Exit(1)
-    path.unlink()
-    con.print(f"[green]deleted[/] {path}")
-
-
-# ── tools ────────────────────────────────────────────────────────────────────
-
-@tool_app.command("list")
-def tool_list() -> None:
-    """Show file-defined tools, and the built-in toolsets."""
-    _load_env()
-    from app import toolsets
-    from app.tools import declarative
-    rows = declarative.describe()
-    if rows:
-        t = Table("kind", "name", "target", "source", box=None, pad_edge=False)
-        for r in rows:
-            t.add_row(r["kind"], f"[bold]{r['name']}[/]", r["target"][:52], r["source"])
-        con.print(t)
-    else:
-        con.print("[yellow]No file-defined tools.[/] Add one with `proteus tool new <name> --http`.")
-    con.print("\n[dim]built-in toolsets[/]")
-    for name in ("basics", "files", "web", "agent", "custom"):
-        tools, _ = toolsets.load_for(name, host_tools=True)
-        con.print(f"  {name:9} {', '.join(t['function']['name'] for t in (tools or [])) or '-'}")
-
-
-_HTTP_TOOL = """---
-name: {name}
-method: GET
-url: https://api.example.com/{name}
-# auth: bearer ${{{upper}_API_KEY}}      # ${{VAR}} is read from the environment
-query:
-  q: "{{{{query}}}}"                     # {{{{name}}}} is filled from the model's arguments
-params:
-  query: {{type: string, required: true, description: What to look up}}
----
-
-Describe what this tool does and when to use it. The model reads this text and
-decides from it whether to call the tool, so write it for the model.
-"""
-
-_PY_TOOL = '''"""Custom tool: {name}."""
-
-SCHEMA = {{
-    "type": "function",
-    "function": {{
-        "name": "{name}",
-        "description": "Describe what this does; the model reads this to decide when to call it.",
-        "parameters": {{
-            "type": "object",
-            "properties": {{
-                "query": {{"type": "string", "description": "What to look up"}},
-            }},
-            "required": ["query"],
-        }},
-    }},
-}}
-
-
-async def handler(user_id: str, args: dict) -> dict:
-    """`user_id` is supplied by the gateway — never trust it from `args`."""
-    return {{"ok": True, "echo": args.get("query")}}
-'''
-
-
-@tool_app.command("new")
-def tool_new(
-    name: str,
-    http: bool = typer.Option(False, "--http", help="Declarative HTTP tool (no code)."),
-    python: bool = typer.Option(False, "--python", help="Python handler stub."),
-) -> None:
-    """Scaffold a new tool, either declarative or Python."""
-    _load_env()
-    from app.tools import declarative
-    if http == python:
-        con.print("[red]Choose exactly one of --http or --python.[/]")
-        raise typer.Exit(1)
-    if http:
-        path = declarative.TOOLS_DIR / f"{name}.md"
-        body = _HTTP_TOOL.format(name=name, upper=name.upper())
-    else:
-        path = declarative.CUSTOM_DIR / f"{name}.py"
-        body = _PY_TOOL.format(name=name)
-    if path.exists():
-        con.print(f"[red]{path} already exists.[/]")
-        raise typer.Exit(1)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    con.print(f"[green]created[/] {path}")
-    con.print("Add [bold]custom[/] to an agent's toolset to expose it, "
-              "then `proteus tool test " + name + " --args '{\"query\":\"hi\"}'`.")
-
-
-@tool_app.command("test")
-def tool_test(name: str, args: str = typer.Option("{}", "--args", help="JSON arguments.")) -> None:
-    """Invoke a tool directly, exactly as the agent loop would."""
-    _load_env()
-    import asyncio
-    from app import toolsets
-    try:
-        parsed = json.loads(args)
-    except json.JSONDecodeError as exc:
-        con.print(f"[red]--args is not valid JSON:[/] {exc}")
-        raise typer.Exit(1)
-    tools, dispatch = toolsets.load_for("custom")
-    known = {t["function"]["name"] for t in (tools or [])}
-    if name not in known:
-        con.print(f"[red]No file-defined tool named {name!r}.[/] Known: {', '.join(sorted(known)) or 'none'}")
-        raise typer.Exit(1)
-    out = asyncio.run(dispatch(name, "cli-user", parsed))
-    con.print_json(json.dumps(out, default=str))
+    pass
 
 
 # ── the running gateway ──────────────────────────────────────────────────────
 
 @app.command()
-def health(remote: str = typer.Option(None, "--remote", help="Gateway URL.")) -> None:
-    """Show /healthz, formatted."""
-    _load_env()
-    try:
-        h = _get(f"{_base(remote)}/healthz")
-    except Exception as exc:
-        con.print(f"[red]unreachable[/] {_base(remote)}: {exc}")
+def health(remote: str = typer.Option(None, "--remote", help="Gateway URL."),
+           as_json: bool = typer.Option(False, "--json")) -> None:
+    """Show /healthz, formatted. Exits non-zero when the gateway is down."""
+    base = base_url(remote)
+    h = get_json(f"{base}/healthz")
+
+    def render(h):
+        colour = {"ok": "green", "degraded": "yellow", "down": "red"}.get(h.get("status"), "white")
+        out.print(f"[{colour}]{str(h.get('status', '?')).upper()}[/]  {base}")
+        out.print(f"  model      : {h.get('model')}")
+        out.print(f"  database   : {'connected' if h.get('db') else 'not connected (chat still works)'}")
+        out.print(f"  toolset    : {h.get('toolset')}")
+        c = h.get("concurrency") or {}
+        out.print(f"  in flight  : {c.get('in_use')}/{c.get('limit')} per worker  "
+                  f"(rejected: {c.get('rejected')})")
+        out.print(f"  channels   : {', '.join(h.get('channels') or []) or 'none'}")
+        auth = h.get("model_auth") or {}
+        if auth.get("detail"):
+            out.print(f"  [yellow]{auth['detail']}[/]")
+
+    emit(h, as_json, render)
+    if h.get("status") == "down":
         raise typer.Exit(1)
-    colour = {"ok": "green", "degraded": "yellow", "down": "red"}.get(h.get("status"), "white")
-    con.print(f"[{colour}]{h.get('status','?').upper()}[/]  {_base(remote)}")
-    con.print(f"  model      : {h.get('model')}")
-    con.print(f"  database   : {'connected' if h.get('db') else 'NOT connected (chat still works)'}")
-    con.print(f"  toolset    : {h.get('toolset')}")
-    c = h.get("concurrency") or {}
-    con.print(f"  in flight  : {c.get('in_use')}/{c.get('limit')} per worker  (rejected: {c.get('rejected')})")
-    con.print(f"  channels   : {', '.join(h.get('channels') or []) or 'none'}")
-    auth = h.get("model_auth") or {}
-    if auth.get("detail"):
-        con.print(f"  [yellow]{auth['detail']}[/]")
 
 
 @app.command()
-def serve(
-    host: str = typer.Option(None, "--host"),
-    port: int = typer.Option(None, "--port"),
-    workers: int = typer.Option(None, "--workers"),
-) -> None:
-    """Run the gateway (what scripts/run.sh does)."""
-    _load_env()
+def serve(host: str = typer.Option(None, "--host"),
+          port: int = typer.Option(None, "--port", "-p"),
+          workers: int = typer.Option(None, "--workers", "-w"),
+          reload: bool = typer.Option(False, "--reload", help="Auto-reload on code change (dev).")) -> None:
+    """Run the gateway."""
+    load_env()
+    from app import config
+
+    if not config.API_KEY:
+        err.print("[yellow]warning:[/] API_KEY is empty — this gateway is unauthenticated.")
+    if config.MODEL.startswith("mock/"):
+        err.print(f"[yellow]warning:[/] MODEL is {config.MODEL}, a synthetic backend.")
+
     cmd = [sys.executable, "-m", "uvicorn", "app.main:app",
-           "--host", host or os.environ.get("HOST", "0.0.0.0"),
-           "--port", str(port or os.environ.get("PORT", "18791")),
-           "--workers", str(workers or os.environ.get("WORKERS", "4")),
-           "--loop", "uvloop", "--http", "httptools",
+           "--host", host or config.HOST,
+           "--port", str(port or config.PORT),
            "--no-access-log", "--timeout-keep-alive", "75"]
+    if reload:
+        cmd += ["--reload"]           # uvicorn refuses --reload alongside --workers
+    else:
+        cmd += ["--workers", str(workers or config.WORKERS),
+                "--loop", "uvloop", "--http", "httptools"]
+
     os.chdir(REPO)
-    raise typer.Exit(subprocess.call(cmd))
+    try:
+        raise typer.Exit(subprocess.call(cmd))
+    except KeyboardInterrupt:
+        raise typer.Exit(0)
 
 
 @app.command()
-def chat(
-    agent: str = typer.Argument(None, help="Agent (profile) to talk to."),
-    remote: str = typer.Option(None, "--remote"),
-    user: str = typer.Option("cli-user", "--user", help="user_id every tool call is scoped to."),
-) -> None:
-    """Interactive REPL against a running gateway. Ctrl-C to leave."""
-    _load_env()
+def chat(agent: str = typer.Argument(None, help="Agent to talk to; omit for the default."),
+         remote: str = typer.Option(None, "--remote"),
+         user: str = typer.Option("cli-user", "--user", help="user_id every tool call is scoped to."),
+         mode: str = typer.Option(None, "--mode", help="One of the agent's named modes.")) -> None:
+    """Interactive chat against a running gateway. /exit or Ctrl-D to leave."""
     import httpx
-    base, key = _base(remote), os.environ.get("API_KEY", "")
-    hdr = {"Authorization": f"Bearer {key}", "X-Proteus-User-Id": user}
+
+    base = base_url(remote)
+    hdr = {"Authorization": f"Bearer {api_key()}", "X-Proteus-User-Id": user}
     if agent:
         hdr["X-Proteus-Profile"] = agent
+    if mode:
+        hdr["X-Proteus-Mode"] = mode
+
     history: list[dict] = []
-    con.print(f"[dim]{base}  agent={agent or 'default'}  user={user}[/]")
-    with httpx.Client(timeout=300) as c:
+    out.print(f"[dim]{base}  agent={agent or 'default'}  user={user}"
+              f"{'  mode=' + mode if mode else ''}[/]")
+    out.print("[dim]/reset clears history · /history shows it · /exit quits[/]\n")
+
+    with httpx.Client(timeout=300) as client:
         while True:
             try:
-                msg = typer.prompt("\nyou")
-            except (KeyboardInterrupt, EOFError):
-                con.print("\n[dim]bye[/]"); return
+                msg = input("you › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                out.print("\n[dim]bye[/]")
+                return
+            if not msg:
+                continue
+            if msg in ("/exit", "/quit"):
+                return
+            if msg == "/reset":
+                history.clear()
+                out.print("[dim]history cleared[/]\n")
+                continue
+            if msg == "/history":
+                out.print(f"[dim]{len(history)} messages[/]")
+                for m in history:
+                    out.print(f"[dim]  {m['role']:9}[/] {m['content'][:100]}")
+                out.print()
+                continue
+
             history.append({"role": "user", "content": msg})
-            con.print("[bold]proteus[/] ", end="")
-            reply = []
+            reply, t0, first = [], time.time(), None
             try:
-                with c.stream("POST", f"{base}/v1/chat/completions", headers=hdr,
-                              json={"stream": True, "messages": history}) as r:
+                with client.stream("POST", f"{base}/v1/chat/completions", headers=hdr,
+                                   json={"stream": True, "messages": history}) as r:
                     if r.status_code != 200:
-                        con.print(f"[red]HTTP {r.status_code}[/] {r.read()[:200]!r}"); history.pop(); continue
+                        body = r.read().decode("utf-8", "replace")[:300]
+                        err.print(f"[red]HTTP {r.status_code}[/] {body}")
+                        history.pop()
+                        continue
+                    sys.stdout.write("\nproteus › ")
+                    sys.stdout.flush()
                     for line in r.iter_lines():
                         if not line.startswith("data:") or line == "data: [DONE]":
                             continue
                         d = json.loads(line[5:])
                         if "proteus_tool_event" in d:
                             e = d["proteus_tool_event"]
-                            con.print(f"\n[dim]  ⚙ {e['tool']} {e['status']} {e['ms']}ms[/]")
+                            colour = "green" if e.get("status") == "ok" else "red"
+                            out.print(f"\n[dim]  ⚙ [/][{colour}]{e['tool']}[/]"
+                                      f"[dim] {e.get('status')} {e.get('ms')}ms[/]")
                             continue
-                        ct = d["choices"][0]["delta"].get("content")
-                        if ct:
-                            reply.append(ct); print(ct, end="", flush=True)
+                        chunk = d["choices"][0]["delta"].get("content")
+                        if chunk:
+                            if first is None:
+                                first = time.time() - t0
+                            sys.stdout.write(chunk)
+                            sys.stdout.flush()
+                            reply.append(chunk)
                 print()
             except KeyboardInterrupt:
-                con.print("\n[dim]interrupted[/]")
-            history.append({"role": "assistant", "content": "".join(reply)})
+                out.print("\n[dim]interrupted[/]")
+            except httpx.HTTPError as exc:
+                err.print(f"[red]connection failed:[/] {exc}")
+                history.pop()
+                continue
+
+            text = "".join(reply)
+            out.print(f"[dim]  {len(text)} chars"
+                      f"{f' · first token {first * 1000:.0f}ms' if first else ''}"
+                      f" · {time.time() - t0:.1f}s[/]\n")
+            history.append({"role": "assistant", "content": text})
 
 
 @app.command()
-def bench(
-    concurrency: int = typer.Option(50, "--concurrency", "-c"),
-    n: int = typer.Option(200, "-n"),
-    remote: str = typer.Option(None, "--remote"),
-) -> None:
-    """Load-test a running gateway. Point MODEL at mock/* first, or it costs real tokens."""
-    _load_env()
-    script = REPO / "tests" / "loadtest.py"
-    raise typer.Exit(subprocess.call(
-        [sys.executable, str(script), "--n", str(n), "--concurrency", str(concurrency),
-         "--base", _base(remote)]))
+def bench(concurrency: int = typer.Option(20, "--concurrency", "-c"),
+          n: int = typer.Option(100, "-n", help="Total requests."),
+          stream: bool = typer.Option(False, "--stream", help="Use SSE instead of JSON."),
+          remote: str = typer.Option(None, "--remote"),
+          as_json: bool = typer.Option(False, "--json")) -> None:
+    """Load-test a running gateway.
+
+    Self-contained, so it works from an installed package rather than needing
+    the test directory. Point MODEL at a `mock/*` backend first unless you mean
+    to spend real tokens; the numbers then measure the gateway, not the provider.
+    """
+    import httpx
+
+    base, key = base_url(remote), api_key()
+    h = get_json(f"{base}/healthz")
+    if not str(h.get("model", "")).startswith("mock/"):
+        err.print(f"[yellow]warning:[/] MODEL is {h.get('model')} — this spends real tokens.")
+
+    async def one(client, i: int) -> tuple[bool, float]:
+        t0 = time.time()
+        hdr = {"Authorization": f"Bearer {key}", "X-Proteus-User-Id": f"bench-{i % 50}"}
+        body: dict = {"messages": [{"role": "user", "content": "hello"}]}
+        try:
+            if stream:
+                body["stream"] = True
+                async with client.stream("POST", f"{base}/v1/chat/completions",
+                                         headers=hdr, json=body) as r:
+                    ok = r.status_code == 200
+                    async for _ in r.aiter_lines():
+                        pass
+            else:
+                r = await client.post(f"{base}/v1/chat/completions", headers=hdr, json=body)
+                ok = r.status_code == 200 and bool(r.json()["choices"][0]["message"]["content"])
+            return ok, time.time() - t0
+        except Exception:
+            return False, time.time() - t0
+
+    async def run_bench() -> dict:
+        sem = asyncio.Semaphore(concurrency)
+        results: list[tuple[bool, float]] = []
+        limits = httpx.Limits(max_connections=concurrency + 20)
+        async with httpx.AsyncClient(timeout=300, limits=limits) as client:
+            async def guarded(i: int) -> None:
+                async with sem:
+                    results.append(await one(client, i))
+            t0 = time.time()
+            await asyncio.gather(*[guarded(i) for i in range(n)])
+            wall = time.time() - t0
+
+        good = sorted(d for ok, d in results if ok)
+        def pct(q: float) -> float:
+            return good[min(int(len(good) * q), len(good) - 1)] if good else 0.0
+        return {"requests": n, "concurrency": concurrency, "streaming": stream,
+                "wall_seconds": round(wall, 2),
+                "throughput_rps": round(n / wall, 1) if wall else 0,
+                "succeeded": len(good), "failed": n - len(good),
+                "p50_ms": round(pct(0.50) * 1000), "p95_ms": round(pct(0.95) * 1000),
+                "p99_ms": round(pct(0.99) * 1000)}
+
+    if not as_json:
+        out.print(f"[dim]{n} requests, {concurrency} concurrent, "
+                  f"{'SSE' if stream else 'JSON'} → {base}[/]")
+    stats = asyncio.run(run_bench())
+
+    def render(s):
+        t = table("metric", "value")
+        t.add_row("wall", f"{s['wall_seconds']}s")
+        t.add_row("throughput", f"{s['throughput_rps']} req/s")
+        t.add_row("succeeded", f"{s['succeeded']}/{s['requests']}")
+        t.add_row("failed", str(s["failed"]))
+        t.add_row("p50 / p95 / p99", f"{s['p50_ms']} / {s['p95_ms']} / {s['p99_ms']} ms")
+        out.print(t)
+
+    emit(stats, as_json, render)
+    if stats["failed"]:
+        raise typer.Exit(1)
 
 
 @app.command()
 def login() -> None:
     """ChatGPT (Codex) OAuth device login, for MODEL=codex/*."""
-    raise typer.Exit(subprocess.call(["bash", str(REPO / "scripts" / "codex_login.sh")]))
+    script = REPO / "scripts" / "codex_login.sh"
+    if not script.exists():
+        die(f"{script} not found", "This command needs a source checkout.")
+    raise typer.Exit(subprocess.call(["bash", str(script)]))
 
 
 @app.command()
-def doctor() -> None:
-    """Check configuration and connectivity, and say what is wrong."""
-    _load_env()
-    from app import config
-    problems: list[str] = []
+def tui(remote: str = typer.Option(None, "--remote"),
+        user: str = typer.Option("tui-user", "--user")) -> None:
+    """Full-screen terminal UI for trying agents out."""
+    try:
+        from .tui import run_tui
+    except ImportError as exc:
+        die(f"the TUI needs textual ({exc})", "Install it:  pip install 'proteus-gateway[tui]'")
+    run_tui(base_url(remote), api_key(), user)
 
-    con.print("[bold]config[/]")
-    con.print(f"  MODEL       : {config.MODEL}")
-    if config.MODEL.startswith("mock/"):
-        problems.append("MODEL is a mock backend — fine for load tests, never for production.")
-    con.print(f"  API_KEY     : {'set' if config.API_KEY else 'EMPTY (open mode)'}")
+
+@app.command()
+def doctor(as_json: bool = typer.Option(False, "--json")) -> None:
+    """Check configuration and connectivity. Exits non-zero if anything is wrong."""
+    load_env()
+    from app import agents_store, config, toolsets
+    from app.tools import declarative
+
+    problems: list[str] = []
+    notes: list[str] = []
+
     if not config.API_KEY:
         problems.append("API_KEY is empty, so the gateway is unauthenticated.")
+    if config.MODEL.startswith("mock/"):
+        problems.append(f"MODEL is {config.MODEL} — a synthetic backend. Never serve this.")
     if config.ADMIN_API_KEY:
-        problems.append("ADMIN_API_KEY is set — HTTP callers presenting it get shell/run_code/email.")
-    con.print(f"  DATABASE_URL: {'set' if config.DATABASE_URL else 'empty (stateless: no memory/channels/cron)'}")
-    con.print(f"  workers x limit: {config.WORKERS} x {config.MAX_CONCURRENT_COMPLETIONS} "
-              f"= {config.WORKERS * config.MAX_CONCURRENT_COMPLETIONS} concurrent completions")
+        notes.append("ADMIN_API_KEY is set: an HTTP caller with it gets shell/run_code/email.")
+    if config.FILES_UNRESTRICTED:
+        notes.append("FILES_ROOT=/ — file reads are unconfined, and therefore host-gated.")
+    if config.ALLOW_PRIVATE_URLS:
+        notes.append("ALLOW_PRIVATE_URLS=true — tools may reach private addresses.")
+    if config.CRON_IN_WEB and config.WORKERS > 1:
+        problems.append(f"CRON_IN_WEB with WORKERS={config.WORKERS}: every worker runs its own "
+                        f"scheduler, so each job fires {config.WORKERS} times. Use WORKERS=1.")
 
-    from app import agents_store, toolsets
-    from app.tools import declarative
+    agents_store.reset()
     agents = agents_store.store().all()
-    con.print("\n[bold]agents[/]")
-    for name, a in sorted(agents.items()):
-        tools, _ = toolsets.load_for(a.toolset)
-        con.print(f"  {name:12} {len(tools or []):2} tools  {a.source}")
-        if not a.prompt.strip():
-            problems.append(f"agent {name} has an empty prompt.")
     if not agents:
-        problems.append("No agents defined at all.")
-    if config.DEFAULT_PROFILE not in agents and agents:
-        problems.append(f"DEFAULT_PROFILE={config.DEFAULT_PROFILE!r} is not a defined agent.")
+        problems.append("No agents are defined.")
+    elif config.DEFAULT_PROFILE not in agents:
+        problems.append(f"DEFAULT_PROFILE={config.DEFAULT_PROFILE!r} is not a defined agent "
+                        f"(have: {', '.join(sorted(agents))}).")
+    for name, agent in agents.items():
+        if not agent.prompt.strip():
+            problems.append(f"agent {name!r} has an empty prompt.")
 
-    rows = declarative.describe()
-    con.print(f"\n[bold]file-defined tools[/] ({len(rows)})")
-    for r in rows:
-        con.print(f"  {r['kind']:7} {r['name']}")
+    if config.TOOLS_BROWSER:
+        try:
+            import playwright  # noqa: F401
+        except ImportError:
+            problems.append("TOOLS_BROWSER=true but playwright is not installed "
+                            "(pip install 'proteus-gateway[browser]').")
 
-    con.print("\n[bold]gateway[/]")
-    try:
-        h = _get(f"{_base(None)}/healthz")
-        con.print(f"  {h['status']}  model={h['model']}  db={h['db']}")
-        if not (h.get("model_auth") or {}).get("ok", True):
+    services: dict[str, str] = {}
+    if config.DATABASE_URL:
+        services["postgres"] = _probe_db()
+    if config.REDIS_URL:
+        services["redis"] = _probe_redis()
+    if config.MEMORY_ENABLED and config.OLLAMA_URL:
+        services["ollama"] = _probe_http(f"{config.OLLAMA_URL}/api/tags")
+    for name, state in services.items():
+        if state != "ok":
+            notes.append(f"{name} is {state} — features needing it degrade rather than fail.")
+
+    gateway = try_json(f"{base_url(None)}/healthz")
+    if gateway is None:
+        gw_state = "not running"
+    else:
+        gw_state = gateway.get("status", "?")
+        if not (gateway.get("model_auth") or {}).get("ok", True):
             problems.append("model credentials are dead — every completion will fail.")
-    except Exception as exc:
-        con.print(f"  [dim]not running ({type(exc).__name__})[/]")
 
+    data = {
+        "version": version(),
+        "model": config.MODEL,
+        "api_key_set": bool(config.API_KEY),
+        "capacity": f"{config.WORKERS} x {config.MAX_CONCURRENT_COMPLETIONS}",
+        "agents": {n: len(toolsets.load_for(a.toolset)[0] or []) for n, a in sorted(agents.items())},
+        "file_tools": len(declarative.describe()),
+        "services": services,
+        "gateway": gw_state,
+        "notes": notes,
+        "problems": problems,
+    }
+
+    def render(d):
+        out.print(f"[bold]proteus {d['version']}[/]")
+        out.print(f"  model    : {d['model']}")
+        out.print(f"  API_KEY  : {'set' if d['api_key_set'] else '[red]EMPTY[/]'}")
+        out.print(f"  capacity : {d['capacity']} concurrent completions")
+        out.print(f"\n[bold]agents[/] ({len(d['agents'])})")
+        for name, count in d["agents"].items():
+            out.print(f"  {name:14} {count} tools")
+        out.print(f"\n[bold]tools[/]   {d['file_tools']} file-defined")
+        if d["services"]:
+            out.print("\n[bold]services[/]")
+            for name, state in d["services"].items():
+                out.print(f"  {name:10} [{'green' if state == 'ok' else 'red'}]{state}[/]")
+        out.print(f"\n[bold]gateway[/] {d['gateway']}")
+        for note in d["notes"]:
+            out.print(f"[dim]  note: {note}[/]")
+        if d["problems"]:
+            out.print("\n[bold yellow]problems[/]")
+            for p in d["problems"]:
+                out.print(f"  [yellow]![/] {p}")
+        else:
+            out.print("\n[green]no problems found[/]")
+
+    emit(data, as_json, render)
     if problems:
-        con.print("\n[bold yellow]issues[/]")
-        for p in problems:
-            con.print(f"  ! {p}")
         raise typer.Exit(1)
-    con.print("\n[green]no issues found[/]")
+
+
+def _probe_db() -> str:
+    from app import db
+
+    async def go() -> str:
+        try:
+            return "ok" if await db.try_init_pool(quiet=True) else "unreachable"
+        finally:
+            await db.close_pool()
+
+    try:
+        return asyncio.run(go())
+    except Exception as exc:
+        return f"error: {type(exc).__name__}"
+
+
+def _probe_redis() -> str:
+    from app import redisc
+
+    async def go() -> str:
+        try:
+            client = await redisc.get_redis()
+            if client is None:
+                return "not configured"
+            await client.ping()
+            return "ok"
+        except Exception:
+            return "unreachable"
+        finally:
+            await redisc.close_redis()
+
+    try:
+        return asyncio.run(go())
+    except Exception:
+        return "unreachable"
+
+
+def _probe_http(url: str) -> str:
+    import httpx
+
+    try:
+        return "ok" if httpx.get(url, timeout=3).status_code < 500 else "error"
+    except Exception:
+        return "unreachable"
 
 
 def run() -> None:
-    app()
+    try:
+        app()
+    except KeyboardInterrupt:
+        err.print("\n[dim]interrupted[/]")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

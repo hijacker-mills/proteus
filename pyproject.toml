@@ -36,6 +36,8 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["playwright>=1.40"]
+tui = ["textual>=0.60"]
+all = ["playwright>=1.40", "textual>=0.60"]
 
 [project.urls]
 Homepage = "https://github.com/hijacker-mills/proteus"

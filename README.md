@@ -416,21 +416,38 @@ that touch a live instance take `--remote URL`, so the same CLI drives
 production.
 
 ```bash
-proteus agent list                       # every agent, its toolset and source
-proteus agent new support --toolset web  # writes agents/support.md
+proteus doctor                       # config, agents, services, gateway
+proteus tui                          # full-screen console for trying agents out
+proteus chat support                 # one conversation, streaming, in the terminal
+
+proteus agent list                   # name, toolset, tool count, source
+proteus agent new support -t web     # writes agents/support.md
 proteus agent show support --prompt
-proteus tool new weather --http          # or --python
-proteus tool test weather --args '{"city":"Accra"}'
+proteus agent validate               # lint every agent; non-zero if any is broken
+
+proteus tool list                    # file-defined tools + every toolset
+proteus tool new weather --http      # or --python
+proteus tool test calculate -a '{"expression":"2+2"}'   # any tool, not just custom
+
+proteus serve                        # run the gateway
+proteus bench -c 200 --stream        # load test (point MODEL at mock/* first)
 proteus health --remote https://gw.example.com
-proteus doctor                           # config + connectivity, says what is wrong
-proteus chat support                     # interactive REPL, streams tool events
-proteus serve                            # what scripts/run.sh does
-proteus bench -c 200                     # load test (point MODEL at mock/* first)
 ```
 
+Every listing command takes `--json`, written raw to stdout with diagnostics on
+stderr, so it pipes into `jq` cleanly. Everything exits non-zero on failure, so
+it scripts.
+
+`proteus tui` is the one to reach for while building an agent: agents in a
+sidebar, streaming replies, and each tool call shown with its status and
+duration as it happens.
+
 `proteus doctor` is the one to run after any config change. It flags an empty
-`API_KEY`, a `DEFAULT_PROFILE` that names no agent, a mock model left on in
-production, agents with empty prompts, and dead model credentials.
+`API_KEY`, a `DEFAULT_PROFILE` naming no agent, a mock model left on in
+production, agents with empty prompts, dead model credentials, `CRON_IN_WEB`
+with several workers, and `TOOLS_BROWSER` without Playwright — then probes
+Postgres, Redis and Ollama so you find out here rather than on the first
+request.
 
 ---
 
