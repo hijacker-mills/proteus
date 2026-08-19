@@ -31,9 +31,10 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import agent, channels, config, cron, db, httpclient, memory, profiles, redisc
+from . import (agent, channels, config, cron, db, httpclient, memory, metrics,
+               profiles, ratelimit, redisc)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("proteus.http")
@@ -135,12 +136,19 @@ for _router in channels.routers():
     app.include_router(_router)
 
 
-def _check_auth(authorization: str | None) -> None:
-    if not config.API_KEY:
-        return  # open mode (dev only)
-    expected = f"Bearer {config.API_KEY}"
-    if not secrets.compare_digest(authorization or "", expected):
-        raise HTTPException(status_code=401, detail="invalid api key")
+def _check_auth(authorization: str | None) -> str:
+    """Return the label of the key used, so logs can say WHICH consumer.
+
+    compare_digest against every configured key rather than a dict lookup: a
+    lookup leaks, through timing, whether a guessed prefix was right.
+    """
+    if not config.API_KEYS:
+        return "open"                     # no keys configured: dev mode
+    presented = authorization or ""
+    for secret, label in config.API_KEYS.items():
+        if secrets.compare_digest(presented, f"Bearer {secret}"):
+            return label
+    raise HTTPException(status_code=401, detail="invalid api key")
 
 
 def _host_tools_allowed(admin_key: str | None) -> bool:
@@ -196,8 +204,25 @@ def _resolve_mode(body: dict[str, Any], header_mode: str | None) -> str | None:
     return None
 
 
+def _record(tenant: str, mode: str, total: float, ttft: float | None,
+            usage: dict, tools: int) -> None:
+    """One place that turns a finished turn into metrics."""
+    metrics.observe("proteus_request_duration_seconds", total, tenant=tenant, mode=mode)
+    if ttft is not None:
+        metrics.observe("proteus_time_to_first_token_seconds", ttft, tenant=tenant)
+    metrics.inc("proteus_tool_calls_total", tools, tenant=tenant)
+    for field, label in (("prompt_tokens", "prompt"), ("completion_tokens", "completion"),
+                         ("cached_tokens", "cached")):
+        if usage.get(field):
+            metrics.inc("proteus_tokens_total", usage[field], tenant=tenant, kind=label)
+    metrics.gauge("proteus_inflight_completions", _limiter.in_use)
+    metrics.gauge("proteus_shed_total", _limiter.rejected)
+    metrics.gauge("proteus_rate_limited_total", ratelimit.limiter.rejected)
+
+
 def _chunk(chat_id: str, created: int, *, delta: dict | None = None,
-           finish: str | None = None, tool_event: dict | None = None) -> str:
+           finish: str | None = None, tool_event: dict | None = None,
+           usage: dict | None = None) -> str:
     payload: dict[str, Any] = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -207,16 +232,21 @@ def _chunk(chat_id: str, created: int, *, delta: dict | None = None,
     }
     if tool_event is not None:
         payload["proteus_tool_event"] = tool_event
+    if usage is not None:
+        # `usage` on a chunk is the OpenAI convention, so existing clients that
+        # already look for it need no change.
+        payload["usage"] = usage
     return f"data: {_dumps(payload)}\n\n"
 
 
 async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
-               extra_system: str = "", host_tools: bool = False) -> AsyncGenerator[str, None]:
+               extra_system: str = "", host_tools: bool = False, tenant: str = "-") -> AsyncGenerator[str, None]:
     chat_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     t0 = time.time()
     ttft: float | None = None
     tools_used = 0
+    usage: dict[str, int] = {}
     # The slot is held for the WHOLE stream, not just the first byte: an
     # in-flight stream is still consuming upstream capacity. `finally` releases
     # it even when the client disconnects mid-stream, which cancels this
@@ -270,28 +300,39 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
                 yield _chunk(chat_id, created, delta={"content": f"\n\n⚠️ {ev['message']}"}, finish="stop")
                 yield "data: [DONE]\n\n"
                 return
+            elif ev["type"] == "usage":
+                usage = ev["usage"]
             elif ev["type"] == "done":
                 break
         out = _flush()                  # ...nor at the end of a clean stream
         if out:
             yield out
+        if usage:
+            yield _chunk(chat_id, created, usage=usage)
         yield _chunk(chat_id, created, finish="stop")
+        metrics.inc("proteus_requests_total", tenant=tenant, mode="stream", outcome="ok")
         yield "data: [DONE]\n\n"
     finally:
         _limiter.release()
-        logger.info("stream user=%s profile=%s ttft=%s total=%.0fms tools=%d inflight=%d",
-                    user_id, profile or config.DEFAULT_PROFILE,
+        _record(tenant, "stream", time.time() - t0, ttft, usage, tools_used)
+        logger.info("stream user=%s tenant=%s profile=%s ttft=%s total=%.0fms tools=%d "
+                    "tokens=%d/%d%s inflight=%d",
+                    user_id, tenant, profile or config.DEFAULT_PROFILE,
                     f"{ttft*1000:.0f}ms" if ttft else "none",
-                    (time.time() - t0) * 1000, tools_used, _limiter.in_use)
+                    (time.time() - t0) * 1000, tools_used,
+                    usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+                    f" cached={usage['cached_tokens']}" if usage.get("cached_tokens") else "",
+                    _limiter.in_use)
 
 
 async def _collect(user_id: str, body: dict[str, Any], profile: str | None = None,
-                   extra_system: str = "", host_tools: bool = False) -> JSONResponse:
+                   extra_system: str = "", host_tools: bool = False, tenant: str = "-") -> JSONResponse:
     chat_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     t0 = time.time()
     text_parts: list[str] = []
     tool_events: list[dict] = []
+    usage: dict[str, int] = {}
     error: str | None = None
     try:
         async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system,
@@ -300,14 +341,20 @@ async def _collect(user_id: str, body: dict[str, Any], profile: str | None = Non
                 text_parts.append(ev["text"])
             elif ev["type"] == "tool":
                 tool_events.append(ev["event"])
+            elif ev["type"] == "usage":
+                usage = ev["usage"]
             elif ev["type"] == "error":
                 error = ev["message"]
                 break
     finally:
         _limiter.release()
-        logger.info("chat user=%s profile=%s total=%.0fms tools=%d inflight=%d",
-                    user_id, profile or config.DEFAULT_PROFILE,
-                    (time.time() - t0) * 1000, len(tool_events), _limiter.in_use)
+        _record(tenant, "json", time.time() - t0, None, usage, len(tool_events))
+        logger.info("chat user=%s tenant=%s profile=%s total=%.0fms tools=%d tokens=%d/%d%s inflight=%d",
+                    user_id, tenant, profile or config.DEFAULT_PROFILE,
+                    (time.time() - t0) * 1000, len(tool_events),
+                    usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+                    f" cached={usage['cached_tokens']}" if usage.get("cached_tokens") else "",
+                    _limiter.in_use)
     content = "".join(text_parts)
     if error and not content:
         content = f"⚠️ {error}"
@@ -322,6 +369,7 @@ async def _collect(user_id: str, body: dict[str, Any], profile: str | None = Non
             "finish_reason": "stop",
         }],
         "proteus_tool_events": tool_events,
+        "usage": usage,
     })
 
 
@@ -334,7 +382,7 @@ async def chat_completions(
     x_proteus_mode: str | None = Header(default=None),
     x_proteus_admin_key: str | None = Header(default=None),
 ):
-    _check_auth(authorization)
+    tenant = _check_auth(authorization)
     try:
         body = await request.json()
     except Exception:
@@ -353,6 +401,16 @@ async def chat_completions(
     # Host-access tools are off for HTTP callers unless an admin key is presented.
     host_tools = _host_tools_allowed(x_proteus_admin_key)
 
+    # Per-user fairness, checked before the shared concurrency pool: one user
+    # must not be able to hold every slot just by asking faster than the others.
+    allowed, retry_after = ratelimit.limiter.check(user_id)
+    if not allowed:
+        logger.warning("rate limited user=%s tenant=%s (retry in %.0fs)",
+                       user_id, tenant, retry_after)
+        raise HTTPException(status_code=429,
+                            detail=f"rate limit exceeded; retry in {retry_after:.0f}s",
+                            headers={"Retry-After": str(int(retry_after))})
+
     # Take a concurrency slot BEFORE starting work. Both _sse and _collect
     # release it in a `finally`, so every exit path (success, error, client
     # disconnect) returns the slot.
@@ -367,7 +425,7 @@ async def chat_completions(
 
     if body.get("stream"):
         return StreamingResponse(
-            _sse(user_id, body, profile, extra_system, host_tools),
+            _sse(user_id, body, profile, extra_system, host_tools, tenant),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -375,12 +433,23 @@ async def chat_completions(
                 "X-Accel-Buffering": "no",  # disable nginx buffering for SSE
             },
         )
-    return await _collect(user_id, body, profile, extra_system, host_tools)
+    return await _collect(user_id, body, profile, extra_system, host_tools, tenant)
 
 
 @app.get("/v1/models")
 async def models():
     return {"object": "list", "data": [{"id": config.MODEL, "object": "model", "owned_by": "proteus"}]}
+
+
+@app.get("/metrics")
+async def prometheus_metrics(authorization: str | None = Header(default=None)) -> Response:
+    """Prometheus exposition. Behind the same auth as everything else, because
+    token counts and tenant labels are business data, not public telemetry."""
+    if not config.METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="metrics are disabled")
+    if config.API_KEYS and not config.METRICS_PUBLIC:
+        _check_auth(authorization)
+    return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/healthz")
@@ -414,6 +483,11 @@ async def healthz():
                 "in_use": _limiter.in_use,
                 "limit": _limiter.limit,
                 "rejected": _limiter.rejected,
+            },
+            "rate_limit": {
+                "per_minute": config.RATE_LIMIT_PER_MINUTE,
+                "users_tracked": ratelimit.limiter.tracked,
+                "rejected": ratelimit.limiter.rejected,
             },
         },
         status_code=200 if serving else 503,

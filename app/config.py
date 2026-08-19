@@ -8,13 +8,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _req(key: str) -> str:
-    val = os.environ.get(key, "").strip()
-    if not val:
-        raise RuntimeError(f"Required env var {key} is not set")
-    return val
-
-
 def _int(key: str, default: int) -> int:
     try:
         return int(os.environ.get(key, "").strip() or default)
@@ -31,6 +24,33 @@ API_KEY = os.environ.get("API_KEY", "").strip()
 # product surface that talks to the gateway, so it would otherwise make host RCE
 # reachable by anyone who obtains it. See toolsets.HOST_TOOLS.
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
+
+# Named keys, so each surface has its own and one can be revoked without
+# rotating for everybody: API_KEYS="web:abc123,mobile:def456". The label is
+# recorded in logs and metrics, which is how you find out WHICH consumer is
+# responsible for a spike. API_KEY still works and is labelled "default".
+def _parse_keys(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        label, sep, secret = pair.partition(":")
+        if sep and secret.strip():
+            out[secret.strip()] = label.strip() or "unnamed"
+    return out
+
+
+API_KEYS = _parse_keys(os.environ.get("API_KEYS", ""))
+if API_KEY:
+    API_KEYS.setdefault(API_KEY, "default")
+
+# Per-user request ceiling, PER WORKER (so the real limit is this x WORKERS).
+# 0 disables. The bucket permits a burst up to RATE_LIMIT_BURST, defaulting to
+# one minute's worth, because a few rapid turns is normal use and a sustained
+# flood is not.
+RATE_LIMIT_PER_MINUTE = _int("RATE_LIMIT_PER_MINUTE", 0)
+RATE_LIMIT_BURST = _int("RATE_LIMIT_BURST", 0) or None
 
 # Server
 HOST = os.environ.get("HOST", "0.0.0.0").strip()
@@ -86,8 +106,17 @@ PROMPT_CACHING = os.environ.get("PROMPT_CACHING", "true").lower() not in ("0", "
 KIMI_CODE_API_KEY = os.environ.get("KIMI_CODE_API_KEY", "").strip()
 KIMI_CODE_API_BASE = os.environ.get("KIMI_CODE_API_BASE", "https://api.kimi.com/coding/v1").rstrip("/")
 
+# Prometheus endpoint. Behind API_KEY auth unless METRICS_PUBLIC — token counts
+# and tenant labels describe your business, not just your servers.
+METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "true").lower() not in ("0", "false", "no")
+METRICS_PUBLIC = os.environ.get("METRICS_PUBLIC", "false").lower() in ("1", "true", "yes")
+
 # Postgres (optional; a pooled endpoint if your provider offers one)
-DATABASE_URL = _req("DATABASE_URL")
+# OPTIONAL, and it has to actually be optional: /v1/chat/completions never
+# touches the database, so a gateway with no DATABASE_URL must start and serve
+# chat rather than refuse to import. Requiring it here contradicted both db.py
+# and the README, and made a fresh install crash before it could say why.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DB_POOL_MIN = _int("DB_POOL_MIN", 2)
 DB_POOL_MAX = _int("DB_POOL_MAX", 20)
 

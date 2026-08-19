@@ -1,5 +1,7 @@
 # proteus
 
+[![CI](https://github.com/hijacker-mills/proteus/actions/workflows/ci.yml/badge.svg)](https://github.com/hijacker-mills/proteus/actions/workflows/ci.yml)
+
 **Many agents. One gateway.**
 
 A **stateless, model-agnostic agent gateway**. Define as many agents as you
@@ -135,6 +137,25 @@ The user id may also arrive as the OpenAI `user` body field, as a
 system message (back-compat). Profile likewise falls back to `body.profile` and
 then to the `session_key` prefix.
 
+### Cost and usage
+
+Every response reports token usage: on the non-streaming body, and as a `usage`
+chunk near the end of an SSE stream (the OpenAI convention, so clients that
+already look for it need no change).
+
+```jsonc
+{"prompt_tokens": 1106, "completion_tokens": 19,
+ "total_tokens": 1125, "cached_tokens": 1088}
+```
+
+It is **accumulated across the whole turn**, not just the last model call: a
+turn that uses three tools makes four completions, and what it cost is their
+sum. `cached_tokens` is what prompt caching actually saved you, which is the
+only way to know the caching is working rather than assume it.
+
+The same numbers reach the logs and `/metrics`, labelled by tenant, so "which
+consumer spent this" has an answer.
+
 ### Streaming shape
 
 Standard OpenAI SSE chunks, plus one extension: **completed tool calls are
@@ -180,6 +201,9 @@ comments in [`.env.example`](.env.example); the essentials:
 | `MAX_TOKENS` / `TEMPERATURE` | `1500` / `0.3` | Ignored by providers that don't accept them. |
 | `REQUEST_TIMEOUT` / `LLM_RETRIES` | `300` / `2` | Ceiling on one completion; retries for transient 429/5xx. |
 | `MAX_CONCURRENT_COMPLETIONS` | `64` | In-flight completions **per worker**, so the real cap is this × `WORKERS`. Over it, `503` + `Retry-After`. `0` disables. |
+| `RATE_LIMIT_PER_MINUTE` | `0` | Per-**user** ceiling, also per worker. `429` + `Retry-After`. `0` disables. |
+| `API_KEYS` | *(empty)* | `web:key1,mobile:key2` — named keys, revocable one at a time. |
+| `METRICS_ENABLED` / `METRICS_PUBLIC` | `true` / `false` | `/metrics`, behind API-key auth by default. |
 | `CONCURRENCY_WAIT` | `20` | Seconds a request waits for a slot before being shed. |
 | `MAX_PARALLEL_TOOLS` | `8` | Tool calls run concurrently within one turn, up to this many. |
 | `PROMPT_CACHING` | `true` | Explicit cache breakpoint for providers that need one (Anthropic). Others cache automatically. |
@@ -713,6 +737,30 @@ This is a deliberate blast-radius choice: a database outage costs you memory,
 not the whole gateway.
 
 ---
+
+## Operating it
+
+**Fairness.** `MAX_CONCURRENT_COMPLETIONS` keeps the gateway upright;
+`RATE_LIMIT_PER_MINUTE` keeps one user from holding every slot while everyone
+else queues. Both are **per worker**, so the real ceiling is the value ×
+`WORKERS`. A token bucket rather than a fixed window, so a few rapid turns are
+fine and a sustained flood is not.
+
+**Revocable access.** `API_KEYS=web:key1,mobile:key2` gives each surface its own
+key. Revoke one by deleting its entry; everyone else keeps working. The label
+appears in every log line and metric, so a spike can be traced to a consumer.
+
+**Metrics.** `/metrics` in Prometheus format, no extra dependency, behind the
+same auth as everything else because token counts describe your business.
+Counters are **per worker**: scrape each one, or `sum()` in PromQL. The
+`proteus_worker_info{pid}` series exists so a scraper can tell them apart
+instead of silently averaging.
+
+```
+proteus_tokens_total{kind="prompt",tenant="web"}      120
+proteus_request_duration_seconds_bucket{le="2",...}     3
+proteus_inflight_completions                            0
+```
 
 ## Measured performance
 

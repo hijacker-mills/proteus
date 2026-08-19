@@ -4,6 +4,10 @@ The agent core: a provider-neutral tool-use loop.
 `run()` is an async generator of structured events:
     {"type": "text",  "text": "..."}      incremental assistant text
     {"type": "tool",  "event": {...}}      a completed tool call (for live UI / audit)
+    {"type": "usage", "usage": {...}}      token counts, ACCUMULATED across the
+                                            whole run — a turn with tools makes
+                                            several model calls, and the cost of
+                                            the turn is their sum, not the last
     {"type": "done"}                        run finished cleanly
     {"type": "error", "message": "..."}    fatal error
 
@@ -72,6 +76,12 @@ async def run(
         yield {"type": "error", "message": "no user message provided"}
         return
 
+    totals: dict[str, int] = {}
+
+    def add_usage(u: dict[str, int] | None) -> None:
+        for key, value in (u or {}).items():
+            totals[key] = totals.get(key, 0) + int(value or 0)
+
     try:
         for _turn in range(config.MAX_TOOL_TURNS):
             text_parts: list[str] = []
@@ -89,8 +99,11 @@ async def run(
                     yield {"type": "text", "text": ev["text"]}
                 elif ev["type"] == "final":
                     tool_calls = ev["tool_calls"]
+                    add_usage(ev.get("usage"))
 
             if not tool_calls:
+                if totals:
+                    yield {"type": "usage", "usage": totals}
                 yield {"type": "done"}
                 return
 
@@ -154,6 +167,8 @@ async def run(
                 })
 
         yield {"type": "text", "text": "\n\n_(reached tool-call limit — try narrowing the question.)_"}
+        if totals:
+            yield {"type": "usage", "usage": totals}
         yield {"type": "done"}
     except Exception as exc:
         yield {"type": "error", "message": str(exc)}

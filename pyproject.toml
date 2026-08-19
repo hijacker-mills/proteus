@@ -37,7 +37,8 @@ dependencies = [
 [project.optional-dependencies]
 browser = ["playwright>=1.40"]
 tui = ["textual>=0.60"]
-all = ["playwright>=1.40", "textual>=0.60"]
+dev = ["pytest>=8.0"]
+all = ["playwright>=1.40", "textual>=0.60", "pytest>=8.0"]
 
 [project.urls]
 Homepage = "https://github.com/hijacker-mills/proteus"
@@ -51,3 +52,10 @@ packages = ["app", "app.cli", "app.tools", "app.tools.custom", "app.memory", "ap
 
 [tool.setuptools.package-data]
 app = ["prompts/*.md", "*.md"]
+
+[tool.pytest.ini_options]
+# Only the fast suite by default. The live-integration scripts in tests/ need a
+# database, a running gateway and a provider, so they are run by hand.
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"

@@ -73,6 +73,37 @@ def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str
     return out_msgs, out_tools
 
 
+def _usage_dict(usage: Any) -> dict[str, int]:
+    """Normalise a provider's usage object into flat ints.
+
+    Providers disagree on the shape: cached tokens live under
+    `prompt_tokens_details.cached_tokens` for OpenAI and as top-level
+    `cache_read_input_tokens` for Anthropic, so both are checked.
+    """
+    def num(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    out = {
+        "prompt_tokens": num(getattr(usage, "prompt_tokens", None)),
+        "completion_tokens": num(getattr(usage, "completion_tokens", None)),
+        "total_tokens": num(getattr(usage, "total_tokens", None)),
+    }
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = num(getattr(details, "cached_tokens", None)) if details else 0
+    cached = cached or num(getattr(usage, "cache_read_input_tokens", None))
+    if cached:
+        out["cached_tokens"] = cached
+    written = num(getattr(usage, "cache_creation_input_tokens", None))
+    if written:
+        out["cache_write_tokens"] = written
+    if not out["total_tokens"]:
+        out["total_tokens"] = out["prompt_tokens"] + out["completion_tokens"]
+    return out
+
+
 async def astream(
     model: str,
     messages: list[dict[str, Any]],
@@ -84,9 +115,15 @@ async def astream(
     """
     Stream one model completion. Yields normalized events:
         {"type": "text", "text": "..."}                      incremental text
-        {"type": "final", "tool_calls": [...], "finish_reason": "..."}   end of turn
+        {"type": "final", "tool_calls": [...], "finish_reason": "...",
+         "usage": {...}}                                     end of turn
 
     Each tool call is {"id": str, "name": str, "arguments": dict}.
+
+    `usage` carries prompt/completion/cached token counts when the provider
+    reports them. Without it the gateway cannot say what a user or an agent
+    cost, which for a shared provider account is the first question asked when
+    the bill arrives.
     """
     # Codex (ChatGPT OAuth) is not a LiteLLM provider — route it to our own
     # Responses-API client. Same normalized event contract, so callers don't care.
@@ -141,6 +178,9 @@ async def astream(
         # courtesy for blips, NOT a substitute for capacity: sustained 429 means
         # the provider tier is too small, and retries will only deepen the queue.
         "num_retries": config.LLM_RETRIES,
+        # Streaming responses omit usage unless it is asked for explicitly, and
+        # the final chunk is the only place it appears.
+        "stream_options": {"include_usage": True},
         **extra_kwargs,
     }
     if tools:
@@ -153,8 +193,12 @@ async def astream(
     # accumulate by index, concatenating the argument-string deltas.
     acc: dict[int, dict[str, Any]] = {}
     finish_reason: str | None = None
+    usage: dict[str, int] = {}
 
     async for chunk in response:
+        # The usage chunk carries no choices, so read it before skipping those.
+        if getattr(chunk, "usage", None):
+            usage = _usage_dict(chunk.usage)
         choices = getattr(chunk, "choices", None)
         if not choices:
             continue
@@ -197,7 +241,8 @@ async def astream(
             "arguments": parsed,
         })
 
-    yield {"type": "final", "tool_calls": tool_calls, "finish_reason": finish_reason}
+    yield {"type": "final", "tool_calls": tool_calls,
+           "finish_reason": finish_reason, "usage": usage}
 
 
 async def close() -> None:

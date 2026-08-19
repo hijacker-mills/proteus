@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # A clean runner is the point. Everything below was previously only ever
+    # proven on one developer's box, where the venv, Postgres, Redis and
+    # Chromium already existed.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Import with no configuration at all
+        # Postgres is documented as optional, so the package must import and
+        # the config must resolve with an empty environment. This is exactly
+        # the case that used to raise "Required env var DATABASE_URL is not set".
+        env:
+          MODEL: mock/instant
+        run: |
+          python -c "import app.main, app.config, app.cli; print('imports clean')"
+
+      - name: Unit tests
+        env:
+          MODEL: mock/instant
+          API_KEY: ci-test-key
+        run: pytest tests/test_units.py
+
+      - name: CLI works from a clean install
+        env:
+          MODEL: mock/instant
+          API_KEY: ci-test-key
+        run: |
+          proteus --version
+          proteus agent list --json
+          proteus tool list --json
+          proteus config --json > /dev/null
+          proteus tool test calculate --args '{"expression":"6*7"}' --json | grep -q '"result": 42'
+
+      - name: Gateway serves a real request end to end
+        env:
+          MODEL: mock/fast
+          API_KEY: ci-test-key
+          WORKERS: "1"
+        run: |
+          proteus serve --port 18799 &
+          for i in $(seq 1 40); do
+            curl -sf "http://127.0.0.1:18799/healthz" >/dev/null && break || sleep 1
+          done
+          curl -sf "http://127.0.0.1:18799/healthz" | tee /dev/stderr | grep -q '"status"'
+          curl -sf -X POST "http://127.0.0.1:18799/v1/chat/completions" \
+            -H "Authorization: Bearer ci-test-key" \
+            -H "X-Proteus-User-Id: ci" \
+            -H "Content-Type: application/json" \
+            -d '{"messages":[{"role":"user","content":"hi"}]}' \
+            | grep -q '"usage"'
+          curl -sf "http://127.0.0.1:18799/metrics" -H "Authorization: Bearer ci-test-key" \
+            | grep -q 'proteus_requests_total\|proteus_request_duration_seconds'
+
+  setup-script:
+    # setup.sh is the documented install path and has never been run anywhere
+    # it had to create a venv from nothing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run setup.sh on a clean checkout
+        run: bash scripts/setup.sh
+      - name: The CLI it installed actually runs
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          proteus --version
+          MODEL=mock/instant proteus doctor || true   # exits non-zero on a mock model, by design

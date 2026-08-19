@@ -130,6 +130,7 @@ async def astream(
     calls: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     finish = "stop"
+    usage: dict[str, int] = {}
 
     # Pooled, process-wide client. Opening one per completion re-handshakes TLS
     # on every turn and discards the pool, which shows up as latency under load.
@@ -187,6 +188,20 @@ async def astream(
                 if etype == "response.failed":
                     err = (ev.get("response", {}) or {}).get("error", {})
                     raise RuntimeError(f"codex response failed: {err.get('message', err)}")
+                # The Responses API reports usage on the terminal event, under
+                # its own names (input/output rather than prompt/completion).
+                u = (ev.get("response") or {}).get("usage") or {}
+                if u:
+                    usage = {
+                        "prompt_tokens": int(u.get("input_tokens") or 0),
+                        "completion_tokens": int(u.get("output_tokens") or 0),
+                        "total_tokens": int(u.get("total_tokens") or 0),
+                    }
+                    cached = int((u.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+                    if cached:
+                        usage["cached_tokens"] = cached
+                    if not usage["total_tokens"]:
+                        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
                 break
 
             elif etype == "error":
@@ -205,4 +220,4 @@ async def astream(
 
     if tool_calls:
         finish = "tool_calls"
-    yield {"type": "final", "tool_calls": tool_calls, "finish_reason": finish}
+    yield {"type": "final", "tool_calls": tool_calls, "finish_reason": finish, "usage": usage}

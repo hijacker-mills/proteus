@@ -87,4 +87,7 @@ async def astream(
             await asyncio.sleep(delay)
         yield {"type": "text", "text": _WORDS[i % len(_WORDS)] + " "}
 
-    yield {"type": "final", "tool_calls": [], "finish_reason": "stop"}
+    # Synthetic but plausible, so the usage path is exercised by load tests.
+    yield {"type": "final", "tool_calls": [], "finish_reason": "stop",
+           "usage": {"prompt_tokens": 40, "completion_tokens": count,
+                     "total_tokens": 40 + count}}
