@@ -74,10 +74,15 @@ channels and scheduled jobs.
 ```bash
 git clone https://github.com/hijacker-mills/proteus.git
 cd proteus
-cp .env.example .env          # set API_KEY, DATABASE_URL, MODEL + a provider key
-bash scripts/setup.sh         # create .venv and install dependencies
-bash scripts/run.sh           # uvicorn on :18791 (WORKERS async workers)
+bash scripts/setup.sh         # venv, install, and put `proteus` on PATH
+cp .env.example .env          # set API_KEY, MODEL + a provider key
+proteus doctor                # check the config, and say what is wrong
+proteus serve                 # uvicorn on :18791
 ```
+
+`setup.sh` installs editable and symlinks the CLI into `~/.local/bin`, so
+`proteus` works from any directory and still resolves `agents/`, `tools/` and
+`.env` from this checkout.
 
 Then:
 
