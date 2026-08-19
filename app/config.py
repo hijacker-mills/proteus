@@ -79,6 +79,13 @@ PROMPT_CACHING = os.environ.get("PROMPT_CACHING", "true").lower() not in ("0", "
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, …).
 # python-dotenv has already loaded them; nothing else to wire up here.
 
+# Kimi Code — Moonshot's coding endpoint. OpenAI-compatible but on its own host
+# with its own key, so it cannot just be `openai/…`: pointing OPENAI_API_BASE at
+# it would hijack every real OpenAI model too. MODEL=kimi-code/<model> routes
+# here instead. `proteus auth login -p kimi-code` sets the key.
+KIMI_CODE_API_KEY = os.environ.get("KIMI_CODE_API_KEY", "").strip()
+KIMI_CODE_API_BASE = os.environ.get("KIMI_CODE_API_BASE", "https://api.kimi.com/coding/v1").rstrip("/")
+
 # Postgres (optional; a pooled endpoint if your provider offers one)
 DATABASE_URL = _req("DATABASE_URL")
 DB_POOL_MIN = _int("DB_POOL_MIN", 2)

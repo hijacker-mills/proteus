@@ -222,9 +222,27 @@ MODEL=anthropic/claude-sonnet-4-6
 MODEL=openai/gpt-4o-mini
 MODEL=openrouter/anthropic/claude-3.5-sonnet
 MODEL=groq/llama-3.3-70b-versatile
-MODEL=ollama/llama3.1                    # fully local
-MODEL=codex/gpt-5.5                      # ChatGPT subscription via OAuth (below)
+MODEL=xai/grok-3-mini
+MODEL=moonshot/kimi-latest                # Kimi, via the Moonshot platform
+MODEL=deepseek/deepseek-chat
+MODEL=ollama/llama3.1                     # fully local
+MODEL=codex/gpt-5.5                       # ChatGPT subscription via OAuth (below)
+MODEL=kimi-code/kimi-for-coding           # Moonshot's coding endpoint (below)
 ```
+
+`proteus auth login` authenticates whichever provider `MODEL` names, and accepts
+the names people actually use: `-p grok` resolves to `xai`, `-p kimi` to
+`moonshot`, `-p claude` to `anthropic`.
+
+**Kimi Code** (`kimi-code/*`) is OpenAI-compatible but lives on its own host with
+its own key, so it deliberately is *not* spelled `openai/*`: pointing
+`OPENAI_API_BASE` at it would silently hijack every real OpenAI model too. It
+gets `KIMI_CODE_API_KEY` and `KIMI_CODE_API_BASE` instead. Its models also reject
+any temperature but `1`, as a hard 400 rather than clamping, so `llm.py` pins it.
+
+**Moonshot** has two regional platforms. A key from the wrong one authenticates
+nowhere and says only "Invalid Authentication", so set `MOONSHOT_API_BASE` to
+`https://api.moonshot.cn/v1` if yours is the China platform.
 
 > **Caveat:** routing is model-agnostic, tool-calling *fidelity* is not. Small
 > local models often emit tool calls as plain-text JSON instead of structured

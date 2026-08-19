@@ -24,7 +24,25 @@ PROBE_MODELS = {
     "mistral": "mistral/mistral-small-latest",
     "gemini": "gemini/gemini-1.5-flash",
     "deepseek": "deepseek/deepseek-chat",
-    "xai": "xai/grok-2-latest",
+    "xai": "xai/grok-3-mini",                 # cheapest current Grok
+    "moonshot": "moonshot/kimi-latest-8k",    # Kimi, smallest context = cheapest probe
+    "kimi-code": "kimi-code/kimi-for-coding",  # Moonshot's coding endpoint
+}
+
+# What people call a provider is not always what LiteLLM calls it. Accepting
+# both means `proteus auth login -p grok` works without anyone having to learn
+# that the prefix is `xai`.
+ALIASES = {
+    "kimicode": "kimi-code",
+    "kimi_code": "kimi-code",
+    "coding": "kimi-code",
+    "grok": "xai",
+    "x": "xai",
+    "kimi": "moonshot",
+    "moonshotai": "moonshot",
+    "claude": "anthropic",
+    "gpt": "openai",
+    "google": "gemini",
 }
 
 PROVIDER_KEYS = {
@@ -36,7 +54,24 @@ PROVIDER_KEYS = {
     "gemini": "GEMINI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "kimi-code": "KIMI_CODE_API_KEY",
 }
+
+
+# Providers with more than one regional endpoint. LiteLLM reads <PROVIDER>_API_BASE
+# from the environment, so this is only here to tell people it exists — a key
+# from the wrong region authenticates nowhere and gives no hint why.
+REGIONAL = {
+    "moonshot": "MOONSHOT_API_BASE  (https://api.moonshot.ai/v1 default, "
+                "https://api.moonshot.cn/v1 for the China platform)",
+}
+
+
+def canonical(name: str) -> str:
+    """Resolve an alias to the prefix LiteLLM actually uses."""
+    key = (name or "").strip().lower()
+    return ALIASES.get(key, key)
 
 
 def _mask(value: str) -> str:
@@ -51,7 +86,7 @@ def _collect() -> dict:
     from app import config
 
     model = config.MODEL
-    provider = model.split("/", 1)[0] if "/" in model else model
+    provider = canonical(model.split("/", 1)[0] if "/" in model else model)
     info: dict = {"model": model, "provider": provider, "ready": False}
 
     if provider in ("codex", "openai-codex"):
@@ -76,6 +111,9 @@ def _collect() -> dict:
         info.update({"kind": "api-key", "env_var": var, "key": _mask(value),
                      "ready": bool(value),
                      "detail": "" if value else f"{var} is not set, so every completion will fail."})
+        if provider == "kimi-code":
+            from app import config as _c
+            info["api_base"] = _c.KIMI_CODE_API_BASE
 
     # Other provider keys present, so a switch is one env var away.
     info["other_keys"] = sorted(v for v in PROVIDER_KEYS.values()
@@ -103,6 +141,8 @@ def info(as_json: bool = typer.Option(False, "--json")) -> None:
                 colour = "red" if hours <= 0 else ("yellow" if hours < 48 else "green")
                 out.print(f"  expires   : [{colour}]{d['expires_at']}"
                           f"  ({hours:.1f}h)[/]" if hours else f"  expires   : [{colour}]{d['expires_at']}[/]")
+        if d.get("api_base"):
+            out.print(f"  endpoint  : {d['api_base']}")
         if d.get("other_keys"):
             out.print(f"  also set  : {', '.join(d['other_keys'])}")
         if d.get("detail"):
@@ -204,7 +244,8 @@ def login(provider: str = typer.Option(None, "--provider", "-p",
     load_env()
     from app import config
 
-    target = (provider or (config.MODEL.split("/", 1)[0] if "/" in config.MODEL else config.MODEL)).lower()
+    target = canonical(provider or (config.MODEL.split("/", 1)[0]
+                                    if "/" in config.MODEL else config.MODEL))
 
     if target in ("codex", "openai-codex"):
         _login_oauth()
@@ -230,7 +271,8 @@ def login(provider: str = typer.Option(None, "--provider", "-p",
     # Validate against a model belonging to THE TARGET PROVIDER. Using
     # config.MODEL would test a different provider entirely whenever --provider
     # is passed, and cheerfully accept a key that does not work.
-    current_provider = config.MODEL.split("/", 1)[0] if "/" in config.MODEL else config.MODEL
+    current_provider = canonical(config.MODEL.split("/", 1)[0]
+                                 if "/" in config.MODEL else config.MODEL)
     probe = config.MODEL if target == current_provider else PROBE_MODELS.get(target)
 
     os.environ[var] = value                      # test before persisting
@@ -238,8 +280,10 @@ def login(provider: str = typer.Option(None, "--provider", "-p",
         err.print(f"[dim]checking the key against {probe}…[/]")
         ok, detail = _try_completion(probe)
         if not ok:
-            die(f"that key did not work: {detail}",
-                f"Nothing was written to .env. Check the key is for {target}.")
+            hint = f"Nothing was written to .env. Check the key is for {target}."
+            if target in REGIONAL:
+                hint += f"\n{target} has more than one regional endpoint; set {REGIONAL[target]}"
+            die(f"that key did not work: {detail}", hint)
     else:
         err.print(f"[yellow]note:[/] no probe model known for {target!r}, so the key "
                   f"was saved unverified. Check it with:  proteus auth test")

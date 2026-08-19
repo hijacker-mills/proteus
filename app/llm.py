@@ -99,6 +99,22 @@ async def astream(
             yield ev
         return
 
+    # Kimi Code: OpenAI-compatible wire format, own host and key. Rewritten to
+    # openai/* with an explicit base so it cannot collide with real OpenAI use.
+    if model.startswith("kimi-code/"):
+        if not config.KIMI_CODE_API_KEY:
+            raise RuntimeError("KIMI_CODE_API_KEY is not set — run: proteus auth login -p kimi-code")
+        model = "openai/" + model.split("/", 1)[1]
+        extra_kwargs = {"api_base": config.KIMI_CODE_API_BASE,
+                        "api_key": config.KIMI_CODE_API_KEY,
+                        # These models reject any temperature but 1, and reject
+                        # it as a hard 400 rather than clamping. drop_params
+                        # cannot help: the parameter is supported, the VALUE is
+                        # not, so it has to be overridden here.
+                        "temperature": 1}
+    else:
+        extra_kwargs = {}
+
     # Synthetic backend for load-testing the gateway with no provider involved.
     if model.startswith("mock/"):
         from . import mock_provider
@@ -125,6 +141,7 @@ async def astream(
         # courtesy for blips, NOT a substitute for capacity: sustained 429 means
         # the provider tier is too small, and retries will only deepen the queue.
         "num_retries": config.LLM_RETRIES,
+        **extra_kwargs,
     }
     if tools:
         kwargs["tools"] = tools
