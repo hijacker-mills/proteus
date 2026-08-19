@@ -128,7 +128,7 @@ def save_creds(creds: dict) -> None:
 async def _refresh(creds: dict) -> dict:
     refresh_token = (creds.get("tokens", {}) or {}).get("refresh_token", "")
     if not refresh_token:
-        raise RuntimeError("no refresh_token — run: bash scripts/codex_login.sh")
+        raise RuntimeError("no refresh_token — run: proteus auth login")
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             config.CODEX_TOKEN_URL,
@@ -163,7 +163,7 @@ async def get_auth() -> tuple[str, str]:
     if not creds:
         raise RuntimeError(
             "No Codex credentials found. Set CODEX_AUTH_SOURCE / log into Hermes or "
-            "the codex CLI, or run: bash scripts/codex_login.sh"
+            "the codex CLI, or run: proteus auth login"
         )
     access = creds["tokens"]["access_token"]
 
@@ -198,7 +198,7 @@ def status() -> dict[str, Any]:
     creds, source, writable = resolve()
     if not creds:
         return {"source": "none", "ok": False,
-                "detail": "no codex credentials — run: bash scripts/codex_login.sh"}
+                "detail": "no codex credentials — run: proteus auth login"}
 
     access = (creds.get("tokens") or {}).get("access_token", "")
     out: dict[str, Any] = {"source": source, "own_chain": writable, "ok": True}
@@ -216,7 +216,7 @@ def status() -> dict[str, Any]:
         out["detail"] = f"token from '{source}' has EXPIRED"
     elif not writable and remaining < 48 * 3600:
         out["detail"] = (f"token from '{source}' expires in {out['expires_in_hours']}h and proteus "
-                         "cannot refresh a borrowed chain — run: bash scripts/codex_login.sh")
+                         "cannot refresh a borrowed chain — run: proteus auth login")
     return out
 
 

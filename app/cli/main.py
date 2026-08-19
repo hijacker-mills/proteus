@@ -11,7 +11,7 @@ import time
 import typer
 
 from . import agents as agents_cmd
-from . import tools_cmd
+from . import auth_cmd, ops_cmd, tools_cmd
 from ._common import (REPO, api_key, base_url, die, emit, err, get_json,
                       load_env, out, table, try_json, version)
 
@@ -22,6 +22,9 @@ app = typer.Typer(
 )
 app.add_typer(agents_cmd.app, name="agent")
 app.add_typer(tools_cmd.app, name="tool")
+app.add_typer(auth_cmd.app, name="auth")
+app.add_typer(ops_cmd.jobs_app, name="jobs")
+app.add_typer(ops_cmd.memory_app, name="memory")
 
 
 def _version_cb(value: bool) -> None:
@@ -264,11 +267,69 @@ def bench(concurrency: int = typer.Option(20, "--concurrency", "-c"),
 
 @app.command()
 def login() -> None:
-    """ChatGPT (Codex) OAuth device login, for MODEL=codex/*."""
-    script = REPO / "scripts" / "codex_login.sh"
-    if not script.exists():
-        die(f"{script} not found", "This command needs a source checkout.")
-    raise typer.Exit(subprocess.call(["bash", str(script)]))
+    """ChatGPT (Codex) OAuth device login. Alias of `proteus auth login`."""
+    auth_cmd.login()
+
+
+@app.command()
+def config(as_json: bool = typer.Option(False, "--json"),
+           show_secrets: bool = typer.Option(False, "--show-secrets",
+                                             help="Print secrets in full. Careful.")) -> None:
+    """Show the configuration actually in effect, with secrets masked.
+
+    Not the same as reading .env: this is what the process resolved after
+    defaults and environment overrides, which is usually where the surprise is.
+    """
+    load_env()
+    from app import config as cfg
+
+    SECRET = ("KEY", "TOKEN", "SECRET", "PASSWORD", "DSN", "DATABASE_URL")
+
+    def show(name: str, value):
+        if not isinstance(value, str) or not value:
+            return value
+        if show_secrets or not any(s in name for s in SECRET):
+            return value
+        if name == "DATABASE_URL":
+            # Keep the shape (host/db) and lose the password — that is the bit
+            # you need when something cannot connect.
+            import re
+            return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", value)
+        return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "***"
+
+    data = {k: show(k, getattr(cfg, k)) for k in sorted(dir(cfg))
+            if k.isupper() and not k.startswith("_")}
+
+    def render(d):
+        groups = {
+            "model": ("MODEL", "MAX_TOKENS", "TEMPERATURE", "MAX_TOOL_TURNS",
+                      "REQUEST_TIMEOUT", "LLM_RETRIES", "PROMPT_CACHING"),
+            "server": ("HOST", "PORT", "WORKERS", "API_KEY", "ADMIN_API_KEY"),
+            "limits": ("MAX_CONCURRENT_COMPLETIONS", "CONCURRENCY_WAIT",
+                       "MAX_PARALLEL_TOOLS", "STREAM_COALESCE_MS", "MAX_JOBS_PER_USER"),
+            "agents": ("DEFAULT_PROFILE", "AGENTS_DIR", "TOOLS_DIR", "TOOLSET",
+                       "SYSTEM_PROMPT_FILE"),
+            "storage": ("DATABASE_URL", "DB_POOL_MIN", "DB_POOL_MAX", "REDIS_URL"),
+            "tools": ("TOOLS_BROWSER", "TOOLS_SHELL", "TOOLS_CODE_EXEC", "TOOLS_EMAIL",
+                      "FILES_ROOT", "ALLOW_PRIVATE_URLS", "SEARCH_URL_TEMPLATE"),
+            "cron": ("CRON_ENABLED", "CRON_IN_WEB", "CRON_TZ", "CRON_CHECK_INTERVAL"),
+        }
+        shown = set()
+        for group, keys in groups.items():
+            rows = [(k, d[k]) for k in keys if k in d]
+            if not rows:
+                continue
+            out.print(f"\n[bold]{group}[/]")
+            for k, v in rows:
+                shown.add(k)
+                out.print(f"  {k:28} {v}")
+        rest = sorted(set(d) - shown)
+        if rest:
+            out.print("\n[dim]other[/]")
+            for k in rest:
+                out.print(f"  [dim]{k:28} {d[k]}[/]")
+
+    emit(data, as_json, render)
 
 
 @app.command()

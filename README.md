@@ -429,6 +429,20 @@ proteus tool list                    # file-defined tools + every toolset
 proteus tool new weather --http      # or --python
 proteus tool test calculate -a '{"expression":"2+2"}'   # any tool, not just custom
 
+proteus auth info                    # which credentials, from where, expiring when
+proteus auth test                    # one real call, to prove they work
+proteus auth keygen                  # a strong value for API_KEY
+proteus config                       # the config actually in effect, secrets masked
+
+proteus jobs list                    # scheduled jobs across all users
+proteus jobs run 4                   # fire one now, without waiting for its schedule
+proteus jobs cancel 4
+
+proteus memory users                 # who the gateway holds memory for
+proteus memory show alice            # working + long-term memory
+proteus memory search alice "where do they live"
+proteus memory forget alice --all    # for when someone asks you to
+
 proteus serve                        # run the gateway
 proteus bench -c 200 --stream        # load test (point MODEL at mock/* first)
 proteus health --remote https://gw.example.com
@@ -441,6 +455,13 @@ it scripts.
 `proteus tui` is the one to reach for while building an agent: agents in a
 sidebar, streaming replies, and each tool call shown with its status and
 duration as it happens.
+
+`proteus auth info` answers the question that actually breaks deployments: which
+credentials this model will use, where they came from, and when they expire. It
+exits non-zero when they are unusable, so it belongs in a deploy check.
+`proteus auth test` goes further and spends a few tokens on a real call, which
+is the only way to tell a key that is *present* from one that *works* — and it
+distinguishes an exhausted quota from a rejected credential.
 
 `proteus doctor` is the one to run after any config change. It flags an empty
 `API_KEY`, a `DEFAULT_PROFILE` naming no agent, a mock model left on in
