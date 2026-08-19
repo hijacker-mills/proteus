@@ -430,6 +430,8 @@ proteus tool new weather --http      # or --python
 proteus tool test calculate -a '{"expression":"2+2"}'   # any tool, not just custom
 
 proteus auth info                    # which credentials, from where, expiring when
+proteus auth login                   # authenticate whichever provider MODEL uses
+proteus auth login -p anthropic      # ...or a specific one
 proteus auth test                    # one real call, to prove they work
 proteus auth keygen                  # a strong value for API_KEY
 proteus config                       # the config actually in effect, secrets masked
@@ -455,6 +457,14 @@ it scripts.
 `proteus tui` is the one to reach for while building an agent: agents in a
 sidebar, streaming replies, and each tool call shown with its status and
 duration as it happens.
+
+`proteus auth login` is provider-agnostic, like everything else here. An OAuth
+provider (a ChatGPT subscription, via `codex/*`) gets a device flow; every other
+provider is an API key, so it prompts without echoing, **makes one real call to
+a cheap model belonging to that provider**, and only writes to `.env` once the
+key demonstrably works. Passing `--provider` probes that provider rather than
+whatever `MODEL` happens to be, so a wrong key cannot be accepted by testing the
+wrong service.
 
 `proteus auth info` answers the question that actually breaks deployments: which
 credentials this model will use, where they came from, and when they expire. It

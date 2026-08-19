@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 
 import typer
 
@@ -12,6 +13,20 @@ app = typer.Typer(no_args_is_help=True, help="Inspect and test model credentials
 
 # Which environment variable each provider prefix reads. LiteLLM picks these up
 # itself, so the CLI has to know the mapping to report on them.
+# A cheap model per provider, used only to prove a key works. Without this a
+# `--provider X` login would validate against whatever MODEL happens to be,
+# which silently accepts a bad key for X.
+PROBE_MODELS = {
+    "anthropic": "anthropic/claude-haiku-4-5-20251001",
+    "openai": "openai/gpt-4o-mini",
+    "openrouter": "openrouter/openai/gpt-4o-mini",
+    "groq": "groq/llama-3.1-8b-instant",
+    "mistral": "mistral/mistral-small-latest",
+    "gemini": "gemini/gemini-1.5-flash",
+    "deepseek": "deepseek/deepseek-chat",
+    "xai": "xai/grok-2-latest",
+}
+
 PROVIDER_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -143,17 +158,138 @@ def test(prompt: str = typer.Option("Reply with exactly: OK", "--prompt"),
     emit(result, as_json, render)
 
 
-@app.command("login")
-def login() -> None:
-    """ChatGPT (Codex) OAuth device login, for MODEL=codex/*."""
+def _write_env(var: str, value: str) -> None:
+    """Set one variable in .env, leaving every other line exactly as it was.
+
+    Rewriting the file from parsed config would drop comments and reorder
+    things, and this is a file people hand-edit.
+    """
     from ._common import REPO
 
-    script = REPO / "scripts" / "codex_login.sh"
-    if not script.exists():
-        die(f"{script} not found", "This command needs a source checkout.")
+    path = REPO / ".env"
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.split("=", 1)[0].strip() == var:
+            lines[i] = f"{var}={value}\n"
+            replaced = True
+            break
+    if not replaced:
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append(f"{var}={value}\n")
+
+    # Written 0600: it now holds a credential.
+    import os as _os
+
+    path.write_text("".join(lines), encoding="utf-8")
+    try:
+        _os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+@app.command("login")
+def login(provider: str = typer.Option(None, "--provider", "-p",
+                                       help="Provider to authenticate. Default: whatever MODEL uses."),
+          key: str = typer.Option(None, "--key",
+                                  help="Supply the key non-interactively (avoid: it lands in shell history).")) -> None:
+    """Authenticate a model provider, whichever one you use.
+
+    OAuth providers (currently `codex`, i.e. a ChatGPT subscription) run a
+    device flow. Everything else is an API key: this prompts for it without
+    echoing, makes one real call to check it actually works, and only then
+    writes it to .env.
+    """
+    load_env()
+    from app import config
+
+    target = (provider or (config.MODEL.split("/", 1)[0] if "/" in config.MODEL else config.MODEL)).lower()
+
+    if target in ("codex", "openai-codex"):
+        _login_oauth()
+        return
+    if target == "mock":
+        die("mock/* is a synthetic backend and needs no credentials",
+            "Point MODEL at a real provider first.")
+
+    var = PROVIDER_KEYS.get(target)
+    if var is None:
+        var = f"{target.upper()}_API_KEY"
+        err.print(f"[yellow]note:[/] {target!r} is not one I know; assuming it reads {var}.")
+
+    value = key
+    if not value:
+        existing = os.environ.get(var, "").strip()
+        if existing:
+            err.print(f"[dim]{var} is already set ({_mask(existing)}).[/]")
+        value = typer.prompt(f"{var}", hide_input=True).strip()
+    if not value:
+        die("no key given")
+
+    # Validate against a model belonging to THE TARGET PROVIDER. Using
+    # config.MODEL would test a different provider entirely whenever --provider
+    # is passed, and cheerfully accept a key that does not work.
+    current_provider = config.MODEL.split("/", 1)[0] if "/" in config.MODEL else config.MODEL
+    probe = config.MODEL if target == current_provider else PROBE_MODELS.get(target)
+
+    os.environ[var] = value                      # test before persisting
+    if probe:
+        err.print(f"[dim]checking the key against {probe}…[/]")
+        ok, detail = _try_completion(probe)
+        if not ok:
+            die(f"that key did not work: {detail}",
+                f"Nothing was written to .env. Check the key is for {target}.")
+    else:
+        err.print(f"[yellow]note:[/] no probe model known for {target!r}, so the key "
+                  f"was saved unverified. Check it with:  proteus auth test")
+
+    _write_env(var, value)
+    out.print(f"[green]saved[/] {var} to .env  ({_mask(value)})")
+    out.print("[dim]Restart the gateway to pick it up:  proteus serve[/]")
+
+
+def _login_oauth() -> None:
+    """Device flow for a ChatGPT subscription."""
     import subprocess
 
-    raise typer.Exit(subprocess.call(["bash", str(script)]))
+    from ._common import REPO
+
+    module_ok = (REPO / "app" / "codex_login.py").exists()
+    if not module_ok:
+        die("the codex login module is missing", "This needs a source checkout.")
+    err.print("[dim]starting the ChatGPT device-code flow…[/]")
+    code = subprocess.call([sys.executable, "-u", "-m", "app.codex_login"], cwd=str(REPO))
+    if code != 0:
+        die("the device flow did not complete")
+    out.print("[green]signed in[/]  proteus now has its own token chain")
+
+
+def _try_completion(model: str) -> tuple[bool, str]:
+    """One tiny real completion against `model`. Returns (worked, detail)."""
+    import importlib
+
+    from app import config, llm
+
+    importlib.reload(config)                     # pick up the key just set
+    async def go() -> str:
+        text = []
+        async for ev in llm.astream(model=model,
+                                    messages=[{"role": "user", "content": "Reply with: OK"}],
+                                    tools=None, max_tokens=8, temperature=0):
+            if ev["type"] == "text":
+                text.append(ev["text"])
+        return "".join(text)
+
+    try:
+        return True, asyncio.run(go()).strip()
+    except Exception as exc:
+        message = str(exc)
+        low = message.lower()
+        if "429" in message or "usage limit" in low or "rate" in low:
+            # A rate limit proves the credential was accepted.
+            return True, "accepted (provider is rate-limiting right now)"
+        return False, message[:180]
 
 
 @app.command("keygen")
