@@ -4,9 +4,9 @@ Tool-event emission.
 Events are the same shape the Hermes plugin used to write to a JSONL file:
     {ts, userId, tool, status, ms, ...context}
 
-In acag they travel two ways:
+In proteus they travel two ways:
   1. INLINE over the SSE stream (primary, scales per-connection — no shared file).
-     The agent attaches each event to a chunk under the `qubi_tool_event` key.
+     The agent attaches each event to a chunk under the `proteus_tool_event` key.
   2. Optionally XADD'd to a Redis stream for cross-request analytics/audit,
      only when REDIS_URL is configured.
 """
@@ -82,7 +82,7 @@ def make_event(
                     break
 
     # Structured render payload for tools with a frontend card (image_search).
-    # Rides along on the same `qubi_tool_event` chunk; telemetry fields above
+    # Rides along on the same `proteus_tool_event` chunk; telemetry fields above
     # are unchanged, so existing consumers keep working.
     if status == "ok":
         data = _render_payload(tool, result)

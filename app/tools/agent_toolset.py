@@ -110,7 +110,8 @@ _SCHEDULE_TOOL = _fn(
         "prompt": {"type": "string", "description": "what to do when it runs (for create)"},
         "cron_expr": {"type": "string", "description": "cron expression for a recurring job"},
         "in_seconds": {"type": "integer", "description": "run once after this many seconds"},
-        "job_id": {"type": "integer", "description": "job id (for cancel)"},
+        "webhook_url": {"type": "string", "description": "Where to POST the result, for callers with no chat channel."},
+                    "job_id": {"type": "integer", "description": "job id (for cancel)"},
     },
     ["action"],
 )
@@ -154,5 +155,6 @@ async def dispatch(name: str, user_id: str, args: dict[str, Any]) -> dict[str, A
             user_id, args.get("action", ""),
             prompt=args.get("prompt"), cron_expr=args.get("cron_expr"),
             in_seconds=args.get("in_seconds"), job_id=args.get("job_id"),
+            webhook_url=args.get("webhook_url"),
         )
     return {"error": f"unknown tool: {name}"}

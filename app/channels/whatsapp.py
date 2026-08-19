@@ -24,7 +24,7 @@ from ..httpclient import get_client
 from .base import handle_inbound
 from ._util import chunks, data_url, send_with_retry
 
-logger = logging.getLogger("acag.channels.whatsapp")
+logger = logging.getLogger("proteus.channels.whatsapp")
 router = APIRouter()
 
 NAME = "whatsapp"

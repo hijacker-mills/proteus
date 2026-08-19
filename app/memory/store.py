@@ -1,9 +1,17 @@
 """
-Postgres + pgvector storage for acag's tiered memory.
+Postgres + pgvector storage for proteus's tiered memory.
 
 Two tables (separate from IntelliQ's NoteEmbedding):
-  acag_message  — durable conversation log (working memory; fetched by recency)
-  acag_memory   — distilled long-term facts/preferences (fetched by semantic similarity)
+  proteus.proteus_message  — durable conversation log (working memory; by recency)
+  proteus.proteus_memory   — distilled long-term facts/preferences (by similarity)
+
+SCHEMA: these live in the dedicated `proteus` Postgres schema, NOT in `public`.
+This is load-bearing. IntelliQ's Prisma owns `public`, and any table it finds
+there that isn't in schema.prisma is treated as drift — every generated
+migration carried `DROP TABLE "proteus_*"`, and two of them were applied (2026-06-27,
+2026-07-15), silently destroying all memory and cron state. Prisma only diffs the
+schemas listed in its datasource (`public`), so an `proteus` schema is invisible to
+it. Keep every statement here schema-qualified.
 
 All vector ops pass the embedding as a text literal cast to ::vector (no driver
 registration needed), matching the rest of the stack.
@@ -16,9 +24,10 @@ from typing import Any
 from ..db import get_pool
 
 _DDL = [
+    "CREATE SCHEMA IF NOT EXISTS proteus",
     "CREATE EXTENSION IF NOT EXISTS vector",
     """
-    CREATE TABLE IF NOT EXISTS acag_message (
+    CREATE TABLE IF NOT EXISTS proteus.proteus_message (
         id         BIGSERIAL PRIMARY KEY,
         user_key   TEXT        NOT NULL,
         channel    TEXT        NOT NULL DEFAULT '',
@@ -27,9 +36,9 @@ _DDL = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
-    "CREATE INDEX IF NOT EXISTS acag_message_user_ts ON acag_message (user_key, created_at)",
+    "CREATE INDEX IF NOT EXISTS proteus_message_user_ts ON proteus.proteus_message (user_key, created_at)",
     """
-    CREATE TABLE IF NOT EXISTS acag_memory (
+    CREATE TABLE IF NOT EXISTS proteus.proteus_memory (
         id           BIGSERIAL PRIMARY KEY,
         user_key     TEXT        NOT NULL,
         kind         TEXT        NOT NULL DEFAULT 'fact',
@@ -41,10 +50,17 @@ _DDL = [
         last_used_at TIMESTAMPTZ
     )
     """,
-    "CREATE UNIQUE INDEX IF NOT EXISTS acag_memory_user_fp ON acag_memory (user_key, fingerprint)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS proteus_memory_user_fp ON proteus.proteus_memory (user_key, fingerprint)",
     """
-    CREATE INDEX IF NOT EXISTS acag_memory_hnsw ON acag_memory
+    CREATE INDEX IF NOT EXISTS proteus_memory_hnsw ON proteus.proteus_memory
         USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS proteus.proteus_todo (
+        user_key   TEXT PRIMARY KEY,
+        items      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
     """,
 ]
 
@@ -68,7 +84,7 @@ def fingerprint(text: str) -> str:
 async def add_message(user_key: str, channel: str, role: str, content: str) -> None:
     async with get_pool().acquire() as conn:
         await conn.execute(
-            'INSERT INTO acag_message ("user_key","channel","role","content") VALUES ($1,$2,$3,$4)',
+            'INSERT INTO proteus.proteus_message ("user_key","channel","role","content") VALUES ($1,$2,$3,$4)',
             user_key, channel, role, content,
         )
 
@@ -76,7 +92,7 @@ async def add_message(user_key: str, channel: str, role: str, content: str) -> N
 async def recent_messages(user_key: str, limit: int) -> list[dict[str, Any]]:
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            'SELECT role, content FROM acag_message WHERE user_key=$1 ORDER BY created_at DESC, id DESC LIMIT $2',
+            'SELECT role, content FROM proteus.proteus_message WHERE user_key=$1 ORDER BY created_at DESC, id DESC LIMIT $2',
             user_key, limit,
         )
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
@@ -85,13 +101,13 @@ async def recent_messages(user_key: str, limit: int) -> list[dict[str, Any]]:
 async def user_turn_count(user_key: str) -> int:
     async with get_pool().acquire() as conn:
         return await conn.fetchval(
-            "SELECT count(*) FROM acag_message WHERE user_key=$1 AND role='user'", user_key
+            "SELECT count(*) FROM proteus.proteus_message WHERE user_key=$1 AND role='user'", user_key
         )
 
 
 async def clear_messages(user_key: str) -> int:
     async with get_pool().acquire() as conn:
-        res = await conn.execute("DELETE FROM acag_message WHERE user_key=$1", user_key)
+        res = await conn.execute("DELETE FROM proteus.proteus_message WHERE user_key=$1", user_key)
     return int(res.split()[-1]) if res else 0
 
 
@@ -103,7 +119,7 @@ async def recall(user_key: str, query_vec: list[float], k: int, min_score: float
         rows = await conn.fetch(
             """
             SELECT id, text, kind, 1 - (embedding <=> $1::vector) AS score
-            FROM   acag_memory
+            FROM   proteus.proteus_memory
             WHERE  user_key = $2 AND embedding IS NOT NULL
             ORDER  BY embedding <=> $1::vector
             LIMIT  $3
@@ -116,7 +132,7 @@ async def recall(user_key: str, query_vec: list[float], k: int, min_score: float
         ]
         if hits:
             await conn.execute(
-                "UPDATE acag_memory SET last_used_at = now() WHERE id = ANY($1::bigint[])",
+                "UPDATE proteus.proteus_memory SET last_used_at = now() WHERE id = ANY($1::bigint[])",
                 [h["id"] for h in hits],
             )
     return hits
@@ -128,7 +144,7 @@ async def nearest_score(user_key: str, query_vec: list[float]) -> float | None:
         val = await conn.fetchval(
             """
             SELECT 1 - (embedding <=> $1::vector)
-            FROM   acag_memory
+            FROM   proteus.proteus_memory
             WHERE  user_key = $2 AND embedding IS NOT NULL
             ORDER  BY embedding <=> $1::vector
             LIMIT  1
@@ -142,10 +158,10 @@ async def add_memory(user_key: str, kind: str, text: str, embedding: list[float]
     async with get_pool().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO acag_memory ("user_key","kind","text","fingerprint","embedding","last_used_at")
+            INSERT INTO proteus.proteus_memory ("user_key","kind","text","fingerprint","embedding","last_used_at")
             VALUES ($1,$2,$3,$4,$5::vector, now())
             ON CONFLICT ("user_key","fingerprint") DO UPDATE SET
-                "salience"     = acag_memory."salience" + 0.5,
+                "salience"     = proteus.proteus_memory."salience" + 0.5,
                 "last_used_at" = now()
             """,
             user_key, kind, text, fingerprint(text), _vec(embedding),
@@ -156,7 +172,7 @@ async def list_memories(user_key: str, limit: int = 200) -> list[dict[str, Any]]
     """All of a user's memories (for the curator to reconcile against)."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            'SELECT id, kind, text, salience FROM acag_memory WHERE user_key=$1 ORDER BY created_at ASC LIMIT $2',
+            'SELECT id, kind, text, salience FROM proteus.proteus_memory WHERE user_key=$1 ORDER BY created_at ASC LIMIT $2',
             user_key, limit,
         )
     return [{"id": r["id"], "kind": r["kind"], "text": r["text"], "salience": float(r["salience"])} for r in rows]
@@ -168,7 +184,7 @@ async def update_memory(mem_id: int, user_key: str, text: str, embedding: list[f
         try:
             res = await conn.execute(
                 """
-                UPDATE acag_memory
+                UPDATE proteus.proteus_memory
                 SET "text"=$3, "fingerprint"=$4, "embedding"=$5::vector,
                     "salience" = "salience" + 0.5, "last_used_at" = now()
                 WHERE id=$1 AND user_key=$2
@@ -182,7 +198,7 @@ async def update_memory(mem_id: int, user_key: str, text: str, embedding: list[f
 
 async def remove_memory(mem_id: int, user_key: str) -> bool:
     async with get_pool().acquire() as conn:
-        res = await conn.execute("DELETE FROM acag_memory WHERE id=$1 AND user_key=$2", mem_id, user_key)
+        res = await conn.execute("DELETE FROM proteus.proteus_memory WHERE id=$1 AND user_key=$2", mem_id, user_key)
     return res.split()[-1] != "0"
 
 
@@ -191,8 +207,8 @@ async def trim(user_key: str, cap: int) -> int:
     async with get_pool().acquire() as conn:
         res = await conn.execute(
             """
-            DELETE FROM acag_memory WHERE id IN (
-                SELECT id FROM acag_memory WHERE user_key=$1
+            DELETE FROM proteus.proteus_memory WHERE id IN (
+                SELECT id FROM proteus.proteus_memory WHERE user_key=$1
                 ORDER BY salience DESC, last_used_at DESC NULLS LAST, created_at DESC
                 OFFSET $2
             )

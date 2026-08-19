@@ -16,7 +16,7 @@ import logging
 from . import signal as signal_ch
 from . import telegram, whatsapp
 
-logger = logging.getLogger("acag.channels")
+logger = logging.getLogger("proteus.channels")
 
 _tasks: list[asyncio.Task] = []
 
@@ -31,6 +31,21 @@ async def deliver(channel: str, target: str, text: str) -> None:
         await signal_ch._send(target, text)
     else:
         logger.warning("deliver: unknown channel %s", channel)
+
+
+def is_trusted(channel: str, sender: str) -> bool:
+    """True only when the channel enforces an explicit allowlist AND this sender
+    is on it — the trust boundary for host-access tools (see toolsets.HOST_TOOLS).
+
+    Evaluated fresh at use time, so removing someone from TELEGRAM_ALLOWED_USERS
+    also strips the privileges of jobs they scheduled earlier. Channels with no
+    allowlist config (WhatsApp, Signal) are never trusted.
+    """
+    from .. import config
+
+    if channel == "telegram":
+        return bool(config.TELEGRAM_ALLOWED_USERS) and sender in config.TELEGRAM_ALLOWED_USERS
+    return False
 
 
 def enabled_channels() -> list[str]:

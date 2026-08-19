@@ -18,9 +18,8 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncGenerator
 
-import httpx
-
 from . import codex_auth, config
+from .httpclient import get_stream_client
 
 
 def _to_input_content(content: Any) -> list[dict]:
@@ -132,64 +131,66 @@ async def astream(
     order: list[str] = []
     finish = "stop"
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as resp:
-            if resp.status_code != 200:
-                detail = (await resp.aread()).decode("utf-8", "replace")[:300]
-                raise RuntimeError(f"codex responses HTTP {resp.status_code}: {detail}")
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if not payload or payload == "[DONE]":
-                    continue
-                try:
-                    ev = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                etype = ev.get("type", "")
+    # Pooled, process-wide client. Opening one per completion re-handshakes TLS
+    # on every turn and discards the pool, which shows up as latency under load.
+    client = get_stream_client()
+    async with client.stream("POST", url, json=body, headers=headers) as resp:
+        if resp.status_code != 200:
+            detail = (await resp.aread()).decode("utf-8", "replace")[:300]
+            raise RuntimeError(f"codex responses HTTP {resp.status_code}: {detail}")
+        async for line in resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            etype = ev.get("type", "")
 
-                if etype == "response.output_text.delta":
-                    delta = ev.get("delta")
-                    if delta:
-                        yield {"type": "text", "text": delta}
+            if etype == "response.output_text.delta":
+                delta = ev.get("delta")
+                if delta:
+                    yield {"type": "text", "text": delta}
 
-                elif etype == "response.output_item.added":
-                    item = ev.get("item", {})
-                    if item.get("type") == "function_call":
-                        iid = item.get("id") or item.get("call_id")
-                        calls[iid] = {
-                            "id": item.get("call_id") or iid,
-                            "name": item.get("name"),
-                            "args": item.get("arguments") or "",
-                        }
+            elif etype == "response.output_item.added":
+                item = ev.get("item", {})
+                if item.get("type") == "function_call":
+                    iid = item.get("id") or item.get("call_id")
+                    calls[iid] = {
+                        "id": item.get("call_id") or iid,
+                        "name": item.get("name"),
+                        "args": item.get("arguments") or "",
+                    }
+                    order.append(iid)
+
+            elif etype == "response.function_call_arguments.delta":
+                iid = ev.get("item_id")
+                if iid in calls:
+                    calls[iid]["args"] += ev.get("delta", "")
+
+            elif etype == "response.output_item.done":
+                item = ev.get("item", {})
+                if item.get("type") == "function_call":
+                    iid = item.get("id") or item.get("call_id")
+                    slot = calls.setdefault(iid, {"id": item.get("call_id") or iid, "name": None, "args": ""})
+                    if iid not in order:
                         order.append(iid)
+                    slot["id"] = item.get("call_id") or slot["id"]
+                    slot["name"] = item.get("name") or slot["name"]
+                    if item.get("arguments"):
+                        slot["args"] = item["arguments"]
 
-                elif etype == "response.function_call_arguments.delta":
-                    iid = ev.get("item_id")
-                    if iid in calls:
-                        calls[iid]["args"] += ev.get("delta", "")
+            elif etype in ("response.completed", "response.failed", "response.incomplete"):
+                if etype == "response.failed":
+                    err = (ev.get("response", {}) or {}).get("error", {})
+                    raise RuntimeError(f"codex response failed: {err.get('message', err)}")
+                break
 
-                elif etype == "response.output_item.done":
-                    item = ev.get("item", {})
-                    if item.get("type") == "function_call":
-                        iid = item.get("id") or item.get("call_id")
-                        slot = calls.setdefault(iid, {"id": item.get("call_id") or iid, "name": None, "args": ""})
-                        if iid not in order:
-                            order.append(iid)
-                        slot["id"] = item.get("call_id") or slot["id"]
-                        slot["name"] = item.get("name") or slot["name"]
-                        if item.get("arguments"):
-                            slot["args"] = item["arguments"]
-
-                elif etype in ("response.completed", "response.failed", "response.incomplete"):
-                    if etype == "response.failed":
-                        err = (ev.get("response", {}) or {}).get("error", {})
-                        raise RuntimeError(f"codex response failed: {err.get('message', err)}")
-                    break
-
-                elif etype == "error":
-                    raise RuntimeError(f"codex stream error: {ev.get('message', ev)}")
+            elif etype == "error":
+                raise RuntimeError(f"codex stream error: {ev.get('message', ev)}")
 
     tool_calls = []
     for iid in order:

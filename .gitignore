@@ -3,7 +3,15 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.bak*
+.env.local
+.env.*.local
 .codex-auth.json
 *.log
 .caliber/
 CALIBER_LEARNINGS.md
+
+# packaging
+*.egg-info/
+build/
+dist/

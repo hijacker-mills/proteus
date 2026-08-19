@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable
 from .. import agent, config, memory
 from ._util import already_processed, session_lock
 
-logger = logging.getLogger("acag.channels")
+logger = logging.getLogger("proteus.channels")
 
 # A bound "send this text back to the sender" coroutine.
 Send = Callable[[str], Awaitable[None]]
@@ -46,6 +46,9 @@ async def handle_inbound(
       retry / redelivery), this is a no-op.
     - Messages for the same sender are serialized via a per-session lock, so a
       burst of quick messages can't race on the same conversation history.
+    - allowed: the channel's sender allowlist. It doubles as the trust boundary
+      for host-access tools — an unrestricted channel (empty allowlist) is open
+      to strangers, so it gets no shell/run_code/email/schedule.
     """
     text = (text or "").strip()
     if not sender or (not text and not images):
@@ -98,7 +101,8 @@ async def handle_inbound(
 
         acc = ""
         try:
-            async for ev in agent.run(user_id=key, messages=messages, extra_system=extra_system):
+            async for ev in agent.run(user_id=key, messages=messages, extra_system=extra_system,
+                                      host_tools=bool(allowed) and sender in allowed):
                 if ev["type"] == "text":
                     acc += ev["text"]
                     if streamer:

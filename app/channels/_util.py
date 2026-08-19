@@ -27,7 +27,7 @@ async def already_processed(dedup_id: str) -> bool:
     Uses Redis (SET NX) when available so dedup holds across web workers."""
     client = await get_redis()
     if client is not None:
-        ok = await client.set(f"acag:seen:{dedup_id}", "1", nx=True, ex=_DEDUP_TTL)
+        ok = await client.set(f"proteus:seen:{dedup_id}", "1", nx=True, ex=_DEDUP_TTL)
         return not ok  # set() returns None if the key already existed
     now = time.time()
     while _seen and next(iter(_seen.values())) < now - _DEDUP_TTL:

@@ -3,18 +3,22 @@ Channel framework smoke test — no real platform required.
 
 Part A: WhatsApp webhook verification + /healthz, via FastAPI TestClient.
 Part B: drives base.handle_inbound through a fake channel across two turns to
-        prove session memory (turn 2 must recall a fact from turn 1).
+        prove working memory (turn 2 must recall a fact from turn 1).
 
 Run:  set -a; . ./.env; set +a; .venv/bin/python tests/channel_smoke.py
 """
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root on sys.path
 
 from fastapi.testclient import TestClient
 
-from app import config
-from app.channels import base, session
+from app import config, db, memory
+from app.channels import base
 
 
 def part_a() -> None:
@@ -43,25 +47,36 @@ def part_a() -> None:
 
 
 async def part_b() -> None:
-    print("== Part B: inbound → agent → session memory (fake channel) ==")
+    print("== Part B: inbound → agent → working memory (fake channel) ==")
     sent: list[str] = []
 
     async def fake_send(text: str) -> None:
         sent.append(text)
 
-    sender = "loadtest-user"
-    await session.clear(f"fake:{sender}")
+    sender = "smoketest-user"
+    key = f"fake:{sender}"
 
-    await base.handle_inbound("fake", sender, "Remember my name is Sam and I like hiking.", fake_send)
-    print("  turn 1 reply:", sent[-1][:120])
+    # Part A's TestClient closed the pool on exit, so open our own. Memory is an
+    # optional feature, so skip rather than fail when there's no database.
+    if not await db.try_init_pool():
+        print("  ⏭  skipped — no database reachable (memory is optional)\n")
+        return
+    await memory.ensure_schema()
+    await memory.clear(key)
+    try:
+        await base.handle_inbound("fake", sender, "Remember my name is Sam and I like hiking.", fake_send)
+        print("  turn 1 reply:", sent[-1][:120])
 
-    await base.handle_inbound("fake", sender, "What's my name and one thing I like?", fake_send)
-    print("  turn 2 reply:", sent[-1][:160])
+        await base.handle_inbound("fake", sender, "What's my name and one thing I like?", fake_send)
+        print("  turn 2 reply:", sent[-1][:160])
 
-    recalled = "sam" in sent[-1].lower()
-    print(f"  ✓ recalled name across turns: {recalled}")
-    assert recalled, "session memory failed — turn 2 did not recall the name"
-    print("  ✓ Part B passed")
+        recalled = "sam" in sent[-1].lower()
+        print(f"  ✓ recalled name across turns: {recalled}")
+        assert recalled, "working memory failed — turn 2 did not recall the name"
+        print("  ✓ Part B passed")
+    finally:
+        await memory.clear(key)
+        await db.close_pool()
 
 
 if __name__ == "__main__":

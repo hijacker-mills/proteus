@@ -25,7 +25,7 @@ async def run_code(code: str) -> dict:
     if not code.strip():
         return {"error": "code required"}
 
-    with tempfile.TemporaryDirectory(prefix="acag_code_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="proteus_code_") as tmp:
         path = os.path.join(tmp, "snippet.py")
         with open(path, "w") as f:
             f.write(code)

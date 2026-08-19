@@ -27,6 +27,51 @@ litellm.drop_params = True          # silently drop params a given provider does
 litellm.suppress_debug_info = True
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
+# The volatile tail of the system prompt. agent._prepare() appends the clock
+# last so everything before it is a byte-stable prefix; this marker is how the
+# two halves are told apart again when a provider needs an explicit cache
+# breakpoint. Defined here (not in agent.py) because agent.py imports llm, and
+# the reverse would be a cycle.
+CLOCK_PREFIX = "\n\nCurrent time: "
+
+# Providers that cache on an explicit breakpoint rather than automatic prefix
+# matching. Everyone else (OpenAI, the Codex Responses backend, Gemini) caches
+# a stable prefix on its own and needs nothing from us.
+_EXPLICIT_CACHE_PREFIXES = ("anthropic/", "bedrock/anthropic", "vertex_ai/claude")
+
+
+def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None):
+    """Mark the stable head of the system prompt (and the tool schemas) cacheable.
+
+    Anthropic caches only up to an explicit `cache_control` breakpoint, so the
+    marker goes on the STABLE half of the system prompt. Marking the whole thing
+    would include the clock and re-write the cache every minute, which costs
+    more than it saves.
+
+    Returns new lists; the originals are left alone because the caller may reuse
+    them across tool-loop turns.
+    """
+    out_msgs = list(messages)
+    for i, m in enumerate(out_msgs):
+        if m.get("role") != "system" or not isinstance(m.get("content"), str):
+            continue
+        stable, sep, volatile = m["content"].rpartition(CLOCK_PREFIX)
+        blocks = (
+            [{"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+             {"type": "text", "text": sep + volatile}]
+            if sep else
+            [{"type": "text", "text": m["content"], "cache_control": {"type": "ephemeral"}}]
+        )
+        out_msgs[i] = {**m, "content": blocks}
+        break
+
+    out_tools = tools
+    if tools:
+        # One breakpoint on the LAST schema covers every tool before it.
+        out_tools = list(tools)
+        out_tools[-1] = {**out_tools[-1], "cache_control": {"type": "ephemeral"}}
+    return out_msgs, out_tools
+
 
 async def astream(
     model: str,
@@ -54,12 +99,32 @@ async def astream(
             yield ev
         return
 
+    # Synthetic backend for load-testing the gateway with no provider involved.
+    if model.startswith("mock/"):
+        from . import mock_provider
+
+        async for ev in mock_provider.astream(
+            model.split("/", 1)[1], messages, tools, max_tokens, temperature, reasoning_effort
+        ):
+            yield ev
+        return
+
+    if config.PROMPT_CACHING and model.startswith(_EXPLICIT_CACHE_PREFIXES):
+        messages, tools = _apply_cache_breakpoint(messages, tools)
+
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": True,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        # Without an explicit timeout a stalled provider connection pins this
+        # request, its SSE stream and a slot in the concurrency limiter forever.
+        "timeout": config.REQUEST_TIMEOUT,
+        # Transient 429/5xx are retried by LiteLLM with backoff. This is a
+        # courtesy for blips, NOT a substitute for capacity: sustained 429 means
+        # the provider tier is too small, and retries will only deepen the queue.
+        "num_retries": config.LLM_RETRIES,
     }
     if tools:
         kwargs["tools"] = tools

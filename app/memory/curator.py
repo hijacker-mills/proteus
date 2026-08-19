@@ -21,7 +21,7 @@ import logging
 from .. import config, llm
 from . import embed, store
 
-logger = logging.getLogger("acag.memory.curator")
+logger = logging.getLogger("proteus.memory.curator")
 
 _PROMPT = (
     "You curate an AI assistant's long-term memory of ONE user. Keep it small, "

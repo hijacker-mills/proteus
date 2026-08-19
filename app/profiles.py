@@ -1,40 +1,74 @@
 """
-Named profiles = (persona prompt, toolset). A request selects one (header
-X-Acag-Profile, or the profile arg); channels use the default. This is how one
-standalone ACAG can be a general assistant on one path and Qubi (the IntelliQ
-study companion) on another, without separate instances.
+Profile resolution: name -> (system prompt, tools, dispatch).
 
-Add a profile by adding an entry to _PROFILES.
+A request picks a profile by name (header X-Proteus-Profile, body.profile, or the
+session_key prefix); channels use DEFAULT_PROFILE. This is how one deployment
+serves a general assistant on one path and a domain agent on another.
+
+Definitions come from `agents_store` — `agents/*.md` when present, otherwise the
+older env-var layout. Nothing here knows which; that is the point of the store.
+
+A profile picks persona and toolset. It does NOT confer privilege: host-access
+tools are added only when the CALLER is trusted, which is why the cache is keyed
+on `host_tools` as well as the name.
 """
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Any
 
-from . import config, toolsets
+from . import agents_store, config, toolsets
 
-_DIR = Path(__file__).parent
-
-# name -> (prompt file relative to app/, toolset string)
-_PROFILES: dict[str, tuple[str, str]] = {
-    "assistant": (config.SYSTEM_PROMPT_FILE, config.TOOLSET),
-    "qubi": (config.QUBI_PROMPT_FILE, config.QUBI_TOOLSET),
-}
-
-_cache: dict[str, tuple[str, list | None, object]] = {}
+# (name, host_tools) -> (prompt, tools, dispatch); also keyed on the store's
+# version so editing an agent file takes effect without a restart.
+_cache: dict[tuple[str, bool, float], tuple[str, list | None, Any]] = {}
 
 
 def names() -> list[str]:
-    return list(_PROFILES)
+    return sorted(agents_store.store().all())
 
 
-def resolve(name: str | None):
+def get(name: str) -> agents_store.Agent | None:
+    return agents_store.store().get(name)
+
+
+def all_agents() -> dict[str, agents_store.Agent]:
+    return agents_store.store().all()
+
+
+def pick(name: str | None) -> agents_store.Agent | None:
+    """The agent a request resolves to, or None when none are defined."""
+    return _pick(name)
+
+
+def _pick(name: str | None) -> agents_store.Agent | None:
+    agents = agents_store.store().all()
+    if not agents:
+        return None
+    for candidate in (name, config.DEFAULT_PROFILE, "assistant"):
+        if candidate and candidate in agents:
+            return agents[candidate]
+    return next(iter(agents.values()))          # last resort: any defined agent
+
+
+def resolve(name: str | None, host_tools: bool = False):
     """Return (system_prompt_text, tools, dispatch) for a profile name."""
-    key = name if name in _PROFILES else config.DEFAULT_PROFILE
-    if key not in _PROFILES:
-        key = "assistant"
-    if key not in _cache:
-        prompt_file, toolset_str = _PROFILES[key]
-        prompt = (_DIR / prompt_file).read_text(encoding="utf-8")
-        tools, dispatch = toolsets.load_for(toolset_str)
-        _cache[key] = (prompt, tools, dispatch)
-    return _cache[key]
+    agent = _pick(name)
+    if agent is None:
+        # No agents defined anywhere. Serve plain chat rather than failing the
+        # request: a gateway with no persona is still a working gateway.
+        tools, dispatch = toolsets.load_for(config.TOOLSET, host_tools=host_tools)
+        return "", tools, dispatch
+
+    key = (agent.name, host_tools, agents_store.store().version())
+    hit = _cache.get(key)
+    if hit is None:
+        tools, dispatch = toolsets.load_for(agent.toolset, host_tools=host_tools)
+        hit = (agent.prompt, tools, dispatch)
+        _cache[key] = hit
+        # Bound the cache: entries are keyed on a store version that changes on
+        # every edit, so without this a long-lived process would accumulate one
+        # set per edit.
+        if len(_cache) > 64:
+            for stale in [k for k in _cache if k[2] != key[2]]:
+                _cache.pop(stale, None)
+    return hit

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the acag virtualenv and install dependencies.
+# Create the proteus virtualenv and install dependencies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

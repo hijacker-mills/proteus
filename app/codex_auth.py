@@ -1,10 +1,10 @@
 """
 OpenAI Codex OAuth — credential load / refresh / device-code login.
 
-acag keeps its OWN token chain in CODEX_AUTH_FILE (default <project>/.codex-auth.json).
+proteus keeps its OWN token chain in CODEX_AUTH_FILE (default <project>/.codex-auth.json).
 This is deliberate: OAuth refresh tokens are single-use/rotating, so sharing a
 chain with Hermes (`~/.hermes/auth.json`) or the codex CLI (`~/.codex/auth.json`)
-would have them invalidate each other. acag logs in independently.
+would have them invalidate each other. proteus logs in independently.
 
 Mechanics mirror the codex CLI / Hermes:
   - access tokens are JWTs; refresh when the `exp` claim is within 120s.
@@ -180,11 +180,44 @@ async def get_auth() -> tuple[str, str]:
             access = (creds or {}).get("tokens", {}).get("access_token", "")
             if not access or _expiring(access):
                 raise RuntimeError(
-                    f"Codex token from '{source}' is expired and acag won't refresh a "
+                    f"Codex token from '{source}' is expired and proteus won't refresh a "
                     f"shared chain (would break {source}). Use Hermes to refresh it, or "
-                    "run scripts/codex_login.sh for acag's own chain."
+                    "run scripts/codex_login.sh for proteus's own chain."
                 )
     return access, account_id(access, creds)
+
+
+def status() -> dict[str, Any]:
+    """Non-throwing snapshot of the credential chain, for /healthz.
+
+    Model auth is the one dependency that fails on a CLOCK rather than on load,
+    so it has to be observable before it bites: a read-only chain (Hermes / the
+    codex CLI) cannot be refreshed by proteus, and when its access token lapses
+    every chat 500s while the DB check still says everything is fine.
+    """
+    creds, source, writable = resolve()
+    if not creds:
+        return {"source": "none", "ok": False,
+                "detail": "no codex credentials — run: bash scripts/codex_login.sh"}
+
+    access = (creds.get("tokens") or {}).get("access_token", "")
+    out: dict[str, Any] = {"source": source, "own_chain": writable, "ok": True}
+    exp = _jwt_claims(access).get("exp")
+    if not isinstance(exp, (int, float)):
+        out["ok"] = False
+        out["detail"] = "cannot read token expiry"
+        return out
+
+    remaining = float(exp) - time.time()
+    out["expires_at"] = datetime.fromtimestamp(float(exp), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out["expires_in_hours"] = round(remaining / 3600, 1)
+    out["ok"] = remaining > 0
+    if not out["ok"]:
+        out["detail"] = f"token from '{source}' has EXPIRED"
+    elif not writable and remaining < 48 * 3600:
+        out["detail"] = (f"token from '{source}' expires in {out['expires_in_hours']}h and proteus "
+                         "cannot refresh a borrowed chain — run: bash scripts/codex_login.sh")
+    return out
 
 
 # ── Device-code login (sync; used by app.codex_login) ────────────────────────
@@ -208,7 +241,7 @@ def device_code_login() -> dict:
         if not user_code or not device_auth_id:
             raise RuntimeError("device code response missing fields")
 
-        print("\nTo authorize acag with your ChatGPT account:\n")
+        print("\nTo authorize proteus with your ChatGPT account:\n")
         print(f"  1. Open:  {issuer}/codex/device")
         print(f"  2. Enter code:  {user_code}\n")
         print("Waiting for sign-in (Ctrl+C to cancel)…")

@@ -24,6 +24,13 @@ def _int(key: str, default: int) -> int:
 
 # Client auth
 API_KEY = os.environ.get("API_KEY", "").strip()
+# Host-access tools (shell, run_code, email, schedule) are NEVER available over
+# HTTP unless the caller also presents this key in X-Proteus-Admin-Key. Empty
+# (the default) means: no HTTP caller can ever reach them, whatever profile they
+# select. API_KEY alone must not be enough — it is typically shared with every
+# product surface that talks to the gateway, so it would otherwise make host RCE
+# reachable by anyone who obtains it. See toolsets.HOST_TOOLS.
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
 
 # Server
 HOST = os.environ.get("HOST", "0.0.0.0").strip()
@@ -35,11 +42,44 @@ MODEL = os.environ.get("MODEL", "anthropic/claude-sonnet-4-6").strip()
 MAX_TOKENS = _int("MAX_TOKENS", 1500)
 MAX_TOOL_TURNS = _int("MAX_TOOL_TURNS", 8)
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.3") or 0.3)
+# Hard ceiling on one upstream completion. A reasoning model on a long answer can
+# legitimately run minutes, so this is generous; its job is to stop a *stalled*
+# connection holding a stream and a concurrency slot indefinitely.
+REQUEST_TIMEOUT = _int("REQUEST_TIMEOUT", 300)
+LLM_RETRIES = _int("LLM_RETRIES", 2)
+
+# Backpressure. Caps upstream completions in flight PER WORKER process, so the
+# real cap is this x WORKERS. Excess requests wait up to CONCURRENCY_WAIT for a
+# slot, then get 503 + Retry-After rather than queueing without bound.
+#
+# Why cap at all: the gateway itself handles thousands of idle connections
+# cheaply, but every in-flight completion consumes provider quota. Without a cap
+# a traffic spike converts directly into provider 429s for EVERY user, including
+# the ones already mid-stream. A cap degrades a spike into "some users wait",
+# which is recoverable, instead of "everyone fails", which is not.
+# 0 disables the limiter entirely.
+MAX_CONCURRENT_COMPLETIONS = _int("MAX_CONCURRENT_COMPLETIONS", 64)
+CONCURRENCY_WAIT = float(os.environ.get("CONCURRENCY_WAIT", "20") or 20)
+
+# Tool calls within ONE turn run concurrently up to this many at a time. Models
+# routinely emit several per turn, and running them in sequence made a turn cost
+# the sum of its tools rather than the slowest one.
+MAX_PARALLEL_TOOLS = _int("MAX_PARALLEL_TOOLS", 8)
+
+# Batch streamed deltas into one SSE frame for this many ms. 0 = off (a frame
+# per token, smoothest). A small value cuts syscalls and CPU under heavy
+# concurrency at a barely perceptible cost to smoothness.
+STREAM_COALESCE_MS = _int("STREAM_COALESCE_MS", 0)
+
+# Send an explicit prompt-cache breakpoint to providers that need one (Anthropic
+# via cache_control). Prefix-caching providers (OpenAI, the Codex Responses
+# backend) cache automatically and ignore this.
+PROMPT_CACHING = os.environ.get("PROMPT_CACHING", "true").lower() not in ("0", "false", "no")
 # Provider API keys are read by LiteLLM directly from the environment
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, …).
 # python-dotenv has already loaded them; nothing else to wire up here.
 
-# Postgres (Neon pooled endpoint)
+# Postgres (optional; a pooled endpoint if your provider offers one)
 DATABASE_URL = _req("DATABASE_URL")
 DB_POOL_MIN = _int("DB_POOL_MIN", 2)
 DB_POOL_MAX = _int("DB_POOL_MAX", 20)
@@ -48,47 +88,70 @@ DB_POOL_MAX = _int("DB_POOL_MAX", 20)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "mxbai-embed-large").strip()
 
-# IntelliQ app (proxy tools)
-INTELLIQ_APP_URL = os.environ.get("INTELLIQ_APP_URL", "http://127.0.0.1:3001").rstrip("/")
-QUBI_INTERNAL_SECRET = os.environ.get("QUBI_INTERNAL_SECRET", "").strip()
-# Map channel identities → IntelliQ student ids for the IntelliQ tools.
-# Format: "telegram:8707843599=cmnw...uelw,signal:+44...=cuid2"
-INTELLIQ_USER_MAP = {
-    k.strip(): v.strip()
-    for pair in os.environ.get("INTELLIQ_USER_MAP", "").split(",") if "=" in pair
-    for k, v in [pair.split("=", 1)]
-}
 
 # Optional integrations
 IMAGE_SEARCH_SERVICE_URL = os.environ.get("IMAGE_SEARCH_SERVICE_URL", "").rstrip("/")
 IMAGE_SEARCH_SERVICE_TOKEN = os.environ.get("IMAGE_SEARCH_SERVICE_TOKEN", "").strip()
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
-TOOL_EVENT_STREAM = os.environ.get("TOOL_EVENT_STREAM", "acag:tool-events").strip()
+TOOL_EVENT_STREAM = os.environ.get("TOOL_EVENT_STREAM", "proteus:tool-events").strip()
 
 # ── Agent identity & tools ───────────────────────────────────────────────────
 # SYSTEM_PROMPT_FILE is relative to the app/ package dir.
 SYSTEM_PROMPT_FILE = os.environ.get("SYSTEM_PROMPT_FILE", "prompts/assistant.md").strip()
-# TOOLSET: "none" (plain chat) | "agent" (web search/fetch + code) | "intelliq" (study tools)
+# TOOLSET: comma list of "none" | "web" | "agent" | "custom" (see app/toolsets.py)
 TOOLSET = os.environ.get("TOOLSET", "none").strip()
 
-# ── Profiles (persona + toolset selectable per request via X-Acag-Profile) ───
-# "assistant" = SYSTEM_PROMPT_FILE + TOOLSET (the general agent, used by channels).
-# "qubi"      = the IntelliQ study companion, served to the IntelliQ app.
+# ── Agents (persona + toolset, selected per request via X-Proteus-Profile) ─────
+# Definitions live in agents/*.md. This names the one to use when a request
+# doesn't ask for a specific agent.
 DEFAULT_PROFILE = os.environ.get("DEFAULT_PROFILE", "assistant").strip()
-QUBI_PROMPT_FILE = os.environ.get("QUBI_PROMPT_FILE", "qubi_soul.md").strip()
-QUBI_TOOLSET = os.environ.get("QUBI_TOOLSET", "intelliq").strip()
+# Directory of agent definitions (agents/*.md). Empty = <repo>/agents. When it
+# holds no definitions, one agent is assembled from SYSTEM_PROMPT_FILE + TOOLSET
+# so the gateway still serves instead of refusing to start.
+AGENTS_DIR = os.environ.get("AGENTS_DIR", "").strip()
+# Directory of declarative HTTP tools (tools/*.md). Empty = <repo>/tools.
+TOOLS_DIR = os.environ.get("TOOLS_DIR", "").strip()
 
 # ── Agent tools ──────────────────────────────────────────────────────────────
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()  # optional; else DuckDuckGo
+# Search providers, tried in this order. With none set, web_search drives the
+# real browser instead — scraping engines over plain HTTP now gets challenged.
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
+BRAVE_SEARCH_API_KEY = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
+SEARCH_URL_TEMPLATE = os.environ.get(
+    "SEARCH_URL_TEMPLATE", "https://www.bing.com/search?q=").strip()
 WEB_FETCH_MAX_CHARS = _int("WEB_FETCH_MAX_CHARS", 6000)
 # Code execution is OFF by default — it runs arbitrary code on this host. Only
 # enable AFTER restricting who can reach the bot (e.g. TELEGRAM_ALLOWED_USERS).
 TOOLS_CODE_EXEC = os.environ.get("TOOLS_CODE_EXEC", "false").strip().lower() in ("1", "true", "yes")
 TOOLS_CODE_TIMEOUT = _int("TOOLS_CODE_TIMEOUT", 12)
-# Browser tool — drives a real headless Chrome via the pw-control CLI (Playwright/CDP).
+# Document root for the read_file / list_files tools. UNSET = the tools refuse
+# outright, which is the safe default: with a root set they can read nothing
+# outside it, which is what keeps them off the host-tool list.
+# Where read_file/list_files may look. Colon-separated, so several roots are
+# allowed. Empty = the tools refuse everything.
+#
+# `FILES_ROOT=/` means the whole filesystem, for a personal assistant whose user
+# is the operator. That is a real privilege — it reads .env, ~/.ssh and any
+# token file on the box — so in that mode the tools become HOST tools and are
+# withheld from untrusted callers exactly like `shell` (see toolsets.host_tools).
+FILES_ROOT = os.environ.get("FILES_ROOT", "").strip()
+FILES_ROOTS = [r.strip() for r in FILES_ROOT.split(":") if r.strip()]
+FILES_UNRESTRICTED = "/" in FILES_ROOTS
+FILES_MAX_BYTES = _int("FILES_MAX_BYTES", 1_000_000)
+
+# SSRF guard. Tools that fetch a model-chosen URL refuse private and metadata
+# addresses. Cloud metadata endpoints stay blocked even when this is true — see
+# app/tools/url_safety.py.
+ALLOW_PRIVATE_URLS = os.environ.get("ALLOW_PRIVATE_URLS", "false").strip().lower() in ("1", "true", "yes")
+
+# Extra directories prepended to PATH for the shell/email tools, so CLIs installed
+# outside the system path (nvm, pyenv, ~/.local/bin) resolve. Colon-separated.
+TOOLS_EXTRA_PATH = os.environ.get(
+    "TOOLS_EXTRA_PATH", os.path.expanduser("~/.local/bin")).strip()
+
+# Browser tool — a real headless Chromium in-process, via Playwright.
 TOOLS_BROWSER = os.environ.get("TOOLS_BROWSER", "true").strip().lower() in ("1", "true", "yes")
-PW_CONTROL_BIN = os.environ.get("PW_CONTROL_BIN", "/home/ubuntu/.nvm/versions/node/v22.22.2/bin/pw-control").strip()
-PW_CONTROL_CDP_PORT = _int("PW_CONTROL_CDP_PORT", 9222)
 TOOLS_BROWSER_TIMEOUT = _int("TOOLS_BROWSER_TIMEOUT", 45)
 # Shell tool — runs arbitrary commands (every CLI: himalaya, aws, git, hf, …). Like
 # run_code, this is host access — keep the bot locked to TELEGRAM_ALLOWED_USERS.
@@ -99,18 +162,17 @@ TOOLS_EMAIL = os.environ.get("TOOLS_EMAIL", "false").strip().lower() in ("1", "t
 TOOLS_EMAIL_TIMEOUT = _int("TOOLS_EMAIL_TIMEOUT", 30)
 HIMALAYA_BIN = os.environ.get("HIMALAYA_BIN", "/home/ubuntu/.local/bin/himalaya").strip()
 
-# ── Channel sessions (per-sender conversation memory) ────────────────────────
-_ACAG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROTEUS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── OpenAI Codex (ChatGPT subscription via OAuth) ────────────────────────────
-# Used when MODEL is prefixed `codex/…` (e.g. MODEL=codex/gpt-5.5). acag keeps
+# Used when MODEL is prefixed `codex/…` (e.g. MODEL=codex/gpt-5.5). proteus keeps
 # its OWN OAuth token chain (refresh tokens are single-use, so it must not share
 # Hermes's or the codex CLI's chain). Run `bash scripts/codex_login.sh` once.
 CODEX_AUTH_FILE = os.path.expanduser(
-    os.environ.get("CODEX_AUTH_FILE", os.path.join(_ACAG_DIR, ".codex-auth.json"))
+    os.environ.get("CODEX_AUTH_FILE", os.path.join(_PROTEUS_DIR, ".codex-auth.json"))
 )
-# Where to read OAuth creds from. "auto" tries acag's own file, then Hermes, then
-# the codex CLI. External sources (hermes/codex) are READ-ONLY — acag never
+# Where to read OAuth creds from. "auto" tries proteus's own file, then Hermes, then
+# the codex CLI. External sources (hermes/codex) are READ-ONLY — proteus never
 # refreshes a chain it shares, since OAuth refresh tokens are single-use and that
 # would break the owner. Hermes keeps its token fresh (multi-day validity), so
 # read-only piggybacking is robust.
@@ -145,11 +207,15 @@ MEMORY_VISION_CAPTION = os.environ.get("MEMORY_VISION_CAPTION", "true").strip().
 
 # ── Cron / scheduled tasks ───────────────────────────────────────────────────
 CRON_ENABLED = os.environ.get("CRON_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Run the scheduler loop inside the WEB process. Needed for an HTTP-only
+# deployment: without channels there is no channels_runner, so nothing would
+# ever fire the jobs the schedule tool creates. Requires WORKERS=1, or several
+# workers race and a job fires more than once.
+CRON_IN_WEB = os.environ.get("CRON_IN_WEB", "false").strip().lower() in ("1", "true", "yes")
 CRON_TZ = os.environ.get("CRON_TZ", "UTC").strip()          # cron expressions interpreted in this tz
+MAX_JOBS_PER_USER = _int("MAX_JOBS_PER_USER", 20)
 CRON_CHECK_INTERVAL = _int("CRON_CHECK_INTERVAL", 30)       # scheduler tick seconds
 
-SESSION_MAX_MESSAGES = _int("SESSION_MAX_MESSAGES", 20)
-SESSION_TTL_SECONDS = _int("SESSION_TTL_SECONDS", 86400)
 # Start channel pollers inside the web process (only safe with WORKERS=1).
 # In production run the dedicated `app.channels_runner` process instead.
 RUN_CHANNELS_IN_WEB = os.environ.get("RUN_CHANNELS_IN_WEB", "").strip().lower() in ("1", "true", "yes")

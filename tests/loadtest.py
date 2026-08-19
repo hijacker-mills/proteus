@@ -1,9 +1,9 @@
 """
-Concurrency load test for acag.
+Concurrency load test for proteus.
 
 Fires N concurrent chat requests and reports success rate + latency percentiles.
 This measures the GATEWAY's concurrency behaviour; remember the real ceiling at
-high N is the upstream provider's rate limit, not acag itself.
+high N is the upstream provider's rate limit, not proteus itself.
 
 Usage:
     .venv/bin/python tests/loadtest.py --n 100 --concurrency 50
@@ -18,12 +18,12 @@ import time
 
 import httpx
 
-USERS = ["qubi_test_alice", "qubi_test_bob", "qubi_test_carol", "qubi_test_dave"]
+USERS = ["loadtest-1", "loadtest-2", "loadtest-3", "loadtest-4"]
 PROMPTS = [
-    "Give me one quick study tip. Be brief.",
-    "What topics have I covered? One sentence.",
-    "Quiz me with one question.",
-    "What do you remember about me? One sentence.",
+    "Give me one quick productivity tip. Be brief.",
+    "Name one interesting fact about the ocean. One sentence.",
+    "What is 17 * 23? Answer with the number only.",
+    "Summarise what a load balancer does. One sentence.",
 ]
 
 
@@ -32,7 +32,7 @@ async def one(client: httpx.AsyncClient, base: str, api_key: str, i: int) -> tup
     try:
         r = await client.post(
             f"{base}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "X-Qubi-User-Id": USERS[i % len(USERS)]},
+            headers={"Authorization": f"Bearer {api_key}", "X-Proteus-User-Id": USERS[i % len(USERS)]},
             json={"messages": [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}]},
         )
         ok = r.status_code == 200 and bool(r.json()["choices"][0]["message"]["content"])

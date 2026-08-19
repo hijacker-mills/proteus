@@ -2,7 +2,7 @@
 Signal channel — via signal-cli-rest-api (bbernhard/signal-cli-rest-api).
 
 Signal has no official bot API; the standard approach is a local signal-cli
-daemon fronted by a REST wrapper. acag polls it for inbound messages and posts
+daemon fronted by a REST wrapper. proteus polls it for inbound messages and posts
 replies back.
 
   receive: GET  {SIGNAL_CLI_REST_URL}/v1/receive/{SIGNAL_NUMBER}
@@ -22,7 +22,7 @@ from ..httpclient import get_client
 from .base import handle_inbound
 from ._util import data_url, send_with_retry
 
-logger = logging.getLogger("acag.channels.signal")
+logger = logging.getLogger("proteus.channels.signal")
 
 NAME = "signal"
 

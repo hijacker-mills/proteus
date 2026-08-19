@@ -14,9 +14,8 @@ import os
 
 from .. import config
 
-_HOME = os.path.expanduser("~")
-_NVM_BIN = os.path.dirname(config.PW_CONTROL_BIN)
-_ENV = {**os.environ, "PATH": f"{_HOME}/.local/bin:{_NVM_BIN}:" + os.environ.get("PATH", "")}
+_ENV = {**os.environ,
+        "PATH": ":".join(p for p in (config.TOOLS_EXTRA_PATH, os.environ.get("PATH", "")) if p)}
 
 
 async def shell(command: str) -> dict:

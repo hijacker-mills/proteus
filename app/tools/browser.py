@@ -1,147 +1,176 @@
 """
-Browser tool — drives a real headless Chrome by shelling out to `pw-control`
-(the user's Playwright/CDP control CLI), via its agent-friendly `--ai` JSON output.
+A real browser, as a packaged tool.
 
-One persistent headless Chrome on CDP :PORT is launched lazily and reused across
-calls (and across acag processes — they share the same CDP endpoint). The agent
-gets a single `browser` tool with actions: navigate / read / click / click_text /
-fill / type / press / eval / back. Interaction actions auto-return a fresh page
-snapshot (title, text, links, buttons, inputs) so the model "sees" the result.
+Playwright drives a headless Chromium in-process. The previous version shelled
+out to a globally-installed Node CLI at a hard-coded path, which is fine on one
+laptop and useless in a project other people install: `pip install
+proteus-gateway[browser] && playwright install chromium` and it works.
 
-Reading uses pw-control `snapshot` (and `eval-js`) rather than screenshots —
-headless Chrome here uses software GL and screenshots are unreliable.
+ONE BROWSER, MANY PAGES. Launching Chromium costs ~300ms and ~80MB, so the
+browser is started once and shared; each call gets its own page and closes it.
+That keeps concurrent calls isolated (their own cookies, their own navigation)
+without paying the launch cost per call.
+
+It returns a SNAPSHOT (title, text, links, inputs, buttons) rather than a
+screenshot, because a model reads structured text far better than pixels, and
+because headless Chrome here has no GPU.
+
+SECURITY. Every URL goes through the SSRF guard in `url_safety` first, so a
+model cannot steer this at cloud metadata or your internal network. That guard
+fails closed.
 """
 from __future__ import annotations
 
 import asyncio
-import json
-import os
+import logging
+from typing import Any
 
 from .. import config
+from .url_safety import is_safe_url_async, refusal
 
-_BIN = config.PW_CONTROL_BIN
-_PORT = str(config.PW_CONTROL_CDP_PORT)
-_ENV = {**os.environ, "PATH": os.path.dirname(_BIN) + os.pathsep + os.environ.get("PATH", "")}
-_launch_lock = asyncio.Lock()
+logger = logging.getLogger("proteus.tools.browser")
+
+_ACTIONS = ("navigate", "read", "click", "click_text", "fill", "type", "press", "back", "eval")
+
+# A default-headless Chromium announces itself as HeadlessChrome, which a lot of
+# sites answer with a challenge page or an empty body. A normal UA and locale is
+# the difference between a usable snapshot and 87 bytes of nothing.
+_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+_browser: Any = None
+_context: Any = None
+_pw: Any = None
+_lock = asyncio.Lock()
 
 
-async def _port_open() -> bool:
-    try:
-        _, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", int(_PORT)), timeout=2)
-        w.close()
-        return True
-    except Exception:
-        return False
+async def _get_context():
+    """Launch once, reuse. Guarded so concurrent first-calls don't race."""
+    global _browser, _context, _pw
+    if _context is not None and _browser is not None and _browser.is_connected():
+        return _context
+    async with _lock:
+        if _context is not None and _browser is not None and _browser.is_connected():
+            return _context
+        from playwright.async_api import async_playwright
 
-
-async def _pw(args: list[str]) -> dict:
-    cmd = [_BIN, *args, "--ai", "--cdp-port", _PORT]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_ENV
+        _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(
+            headless=True,
+            # --no-sandbox is required in most containers; --disable-dev-shm-usage
+            # avoids Chrome dying on the small /dev/shm a container usually gets.
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=config.TOOLS_BROWSER_TIMEOUT)
-    except asyncio.TimeoutError:
-        return {"ok": False, "error": "browser action timed out"}
-    except Exception as exc:
-        return {"ok": False, "error": f"pw-control spawn failed: {exc}"}
-    raw = out.decode("utf-8", "replace").strip()
-    a, b = raw.find("{"), raw.rfind("}")
-    if a == -1:
-        return {"ok": False, "error": (err.decode("utf-8", "replace")[:200] or "no output")}
+        _context = await _browser.new_context(user_agent=_UA, locale="en-US")
+        logger.info("headless chromium launched")
+        return _context
+
+
+async def close() -> None:
+    global _browser, _context, _pw
+    _context = None
+    if _browser is not None:
+        try:
+            await _browser.close()
+        except Exception:
+            pass
+        _browser = None
+    if _pw is not None:
+        try:
+            await _pw.stop()
+        except Exception:
+            pass
+        _pw = None
+
+
+async def _snapshot(page, max_chars: int) -> dict[str, Any]:
+    """What the model actually needs: readable text plus the things it can act on."""
     try:
-        return json.loads(raw[a:b + 1])
+        text = await page.inner_text("body")
     except Exception:
-        return {"ok": False, "error": "unparseable pw-control output"}
-
-
-async def _ensure_chrome() -> bool:
-    if await _port_open():
-        return True
-    async with _launch_lock:
-        if await _port_open():
-            return True
-        await _pw(["navigate", "about:blank", "--launch-chrome", "--headless", "--no-sandbox"])
-        for _ in range(12):
-            if await _port_open():
-                return True
-            await asyncio.sleep(0.5)
-        return await _port_open()
-
-
-async def _snapshot(max_text: int = 1500) -> dict:
-    r = await _pw(["snapshot", "--max-text", str(max_text)])
-    d = r.get("data", {}) if isinstance(r, dict) else {}
+        text = ""
+    js = """() => ({
+        links: [...document.querySelectorAll('a[href]')].slice(0, 40)
+            .map(a => ({text: (a.innerText||'').trim().slice(0,80), href: a.href}))
+            .filter(l => l.text),
+        buttons: [...document.querySelectorAll('button,[role=button],input[type=submit]')]
+            .slice(0, 20).map(b => (b.innerText || b.value || '').trim().slice(0, 60)).filter(Boolean),
+        inputs: [...document.querySelectorAll('input,textarea,select')].slice(0, 20)
+            .map(i => ({name: i.name || i.id || '', type: i.type || i.tagName.toLowerCase(),
+                        placeholder: i.placeholder || ''})).filter(i => i.name || i.placeholder),
+    })"""
+    try:
+        parts = await page.evaluate(js)
+    except Exception:
+        parts = {"links": [], "buttons": [], "inputs": []}
     return {
-        "title": d.get("title"),
-        "url": d.get("url"),
-        "text": d.get("text"),
-        "links": (d.get("links") or [])[:15],
-        "buttons": (d.get("buttons") or [])[:12],
-        "inputs": (d.get("inputs") or [])[:12],
+        "url": page.url,
+        "title": await page.title(),
+        "text": " ".join((text or "").split())[:max_chars],
+        **parts,
     }
 
 
-async def browser(
-    action: str,
-    url: str | None = None,
-    selector: str | None = None,
-    text: str | None = None,
-    key: str | None = None,
-    code: str | None = None,
-) -> dict:
-    if not await _ensure_chrome():
-        return {"error": "could not start browser (Chrome failed to launch)"}
+async def browser(action: str, url: str = "", selector: str = "", text: str = "",
+                  key: str = "", script: str = "", max_chars: int = 4000) -> dict[str, Any]:
+    if not config.TOOLS_BROWSER:
+        return {"error": "browser tool is disabled (set TOOLS_BROWSER=true)"}
+    action = (action or "navigate").strip().lower()
+    if action not in _ACTIONS:
+        return {"error": f"unknown action {action!r}; expected one of {', '.join(_ACTIONS)}"}
 
-    action = (action or "").strip()
+    if url and not await is_safe_url_async(url):
+        return refusal(url)
+
     try:
-        if action == "navigate":
-            if not url:
-                return {"error": "url required for navigate"}
-            r = await _pw(["navigate", url])
-            if not r.get("ok"):
-                return {"error": r.get("error", "navigate failed")}
-            return {"ok": True, "action": "navigate", **await _snapshot()}
-
-        if action in ("read", "snapshot"):
-            return {"ok": True, "action": "read", **await _snapshot(3000)}
-
-        if action == "click":
-            if not selector:
-                return {"error": "selector required for click"}
-            r = await _pw(["click", selector])
-            return {"ok": r.get("ok", False), "action": "click", "error": r.get("error"), **await _snapshot()}
-
-        if action == "click_text":
-            r = await _pw(["click-text", text or ""])
-            return {"ok": r.get("ok", False), "action": "click_text", "error": r.get("error"), **await _snapshot()}
-
-        if action == "fill":
-            if not selector:
-                return {"error": "selector required for fill"}
-            r = await _pw(["fill", selector, text or ""])
-            return {"ok": r.get("ok", False), "action": "fill", "error": r.get("error"), **await _snapshot()}
-
-        if action == "type":
-            if not selector:
-                return {"error": "selector required for type"}
-            r = await _pw(["type", selector, text or ""])
-            return {"ok": r.get("ok", False), "action": "type", "error": r.get("error"), **await _snapshot()}
-
-        if action == "press":
-            r = await _pw(["press", key or "Enter"])
-            return {"ok": r.get("ok", False), "action": "press", "error": r.get("error"), **await _snapshot()}
-
-        if action == "back":
-            await _pw(["eval-js", "history.back()"])
-            await asyncio.sleep(0.6)
-            return {"ok": True, "action": "back", **await _snapshot()}
-
-        if action == "eval":
-            r = await _pw(["eval-js", code or ""])
-            return {"ok": r.get("ok", False), "action": "eval",
-                    "result": (r.get("data") or {}).get("result"), "error": r.get("error")}
-
-        return {"error": f"unknown browser action: {action}"}
+        ctx = await _get_context()
+    except ImportError:
+        return {"error": "playwright is not installed — pip install 'proteus-gateway[browser]' "
+                         "and run: playwright install chromium"}
     except Exception as exc:
-        return {"error": f"browser failed: {exc}"}
+        return {"error": f"could not start the browser: {exc}"}
+
+    page = None
+    try:
+        page = await ctx.new_page()
+        page.set_default_timeout(config.TOOLS_BROWSER_TIMEOUT * 1000)
+        if url:
+            await page.goto(url, wait_until="domcontentloaded")
+            # Most pages render their real content after DOMContentLoaded, so
+            # snapshotting immediately returns a shell. Bounded, because plenty
+            # of pages never reach networkidle at all.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+        if action in ("navigate", "read"):
+            pass
+        elif action == "click":
+            await page.click(selector)
+        elif action == "click_text":
+            await page.get_by_text(text, exact=False).first.click()
+        elif action in ("fill", "type"):
+            await page.fill(selector, text)
+        elif action == "press":
+            await page.press(selector or "body", key or "Enter")
+        elif action == "back":
+            await page.go_back()
+        elif action == "eval":
+            return {"result": await page.evaluate(script)}
+
+        if action not in ("navigate", "read"):
+            # Let whatever the interaction triggered settle before snapshotting.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+        return await _snapshot(page, max_chars)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass

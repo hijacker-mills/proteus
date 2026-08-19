@@ -16,13 +16,26 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .. import config, llm
+from .. import config, db, llm
 from . import curator, embed, store
 
-logger = logging.getLogger("acag.memory")
+logger = logging.getLogger("proteus.memory")
+
+
+def enabled() -> bool:
+    """Memory needs both the config flag and a live pool — the database is
+    optional, so every entry point below degrades to stateless instead of
+    raising when it is missing."""
+    return config.MEMORY_ENABLED and db.available()
 
 ensure_schema = store.ensure_schema
-clear = store.clear_messages
+
+
+async def clear(user_key: str) -> int:
+    """Wipe working memory for one person. 0 when there is no database."""
+    if not db.available():
+        return 0
+    return await store.clear_messages(user_key)
 
 _CAPTION_SYS = "You write concise, factual descriptions of images for an AI assistant's long-term memory."
 _CAPTION_INSTR = (
@@ -63,10 +76,14 @@ async def prepare(user_key: str, text: str, content: object = None) -> tuple[lis
     multimodal parts (text + image_url) for vision turns. Defaults to `text`.
     """
     turn = content if content is not None else text
-    if not config.MEMORY_ENABLED:
+    if not enabled():
         return [{"role": "user", "content": turn}], ""
 
-    recent = await store.recent_messages(user_key, config.MEMORY_RECENT_MESSAGES)
+    try:
+        recent = await store.recent_messages(user_key, config.MEMORY_RECENT_MESSAGES)
+    except Exception:
+        logger.exception("history fetch failed for %s — answering without memory", user_key)
+        return [{"role": "user", "content": turn}], ""
 
     extra = ""
     if text and text.strip():
@@ -88,10 +105,14 @@ async def prepare(user_key: str, text: str, content: object = None) -> tuple[lis
 
 async def record(user_key: str, channel: str, user_text: str, assistant_text: str) -> None:
     """Persist the exchange; schedule distillation every MEMORY_DISTILL_EVERY turns."""
-    if not config.MEMORY_ENABLED:
+    if not enabled():
         return
-    await store.add_message(user_key, channel, "user", user_text)
-    await store.add_message(user_key, channel, "assistant", assistant_text)
+    try:
+        await store.add_message(user_key, channel, "user", user_text)
+        await store.add_message(user_key, channel, "assistant", assistant_text)
+    except Exception:
+        logger.exception("persisting turn failed for %s — reply already sent", user_key)
+        return
     try:
         n = await store.user_turn_count(user_key)
         if config.MEMORY_DISTILL_EVERY > 0 and n % config.MEMORY_DISTILL_EVERY == 0:

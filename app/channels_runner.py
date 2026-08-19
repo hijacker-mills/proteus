@@ -17,14 +17,23 @@ import signal as signalmod
 from . import channels, cron, db, httpclient, memory, redisc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-logger = logging.getLogger("acag.channels_runner")
+logger = logging.getLogger("proteus.channels_runner")
 
 
-async def main() -> None:
-    await db.init_pool()
+async def _db_ready() -> None:
     await memory.ensure_schema()
     await cron.ensure_schema()
     await cron.start_scheduler()
+
+
+async def main() -> None:
+    # Channels need the database for memory, but crash-looping the poller
+    # through an outage only loses inbound messages. Start anyway; the bot
+    # answers without memory and picks it back up on reconnect.
+    if await db.try_init_pool():
+        await _db_ready()
+    else:
+        await db.start_reconnector(on_connect=_db_ready)
     enabled = channels.enabled_channels()
     if not enabled:
         logger.warning("no channels configured — set TELEGRAM_BOT_TOKEN / SIGNAL_* and restart")
@@ -42,6 +51,7 @@ async def main() -> None:
 
     await stop.wait()
     logger.info("shutting down…")
+    await db.stop_reconnector()
     await cron.stop_scheduler()
     await channels.stop_pollers()
     await db.close_pool()
