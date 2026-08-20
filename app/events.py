@@ -41,7 +41,17 @@ def _render_payload(tool: str, result: Any) -> dict[str, Any] | None:
             src = im.get("src") or im.get("url")
             if not src:
                 continue
-            cards.append({"src": str(src), "alt": str(im.get("alt") or "")[:200]})
+            card: dict[str, Any] = {"src": str(src), "alt": str(im.get("alt") or "")[:200]}
+            # Where the image came from. The scraper returns it and we used to
+            # drop it, so diagrams reached the student with no attribution —
+            # the one thing a study tool showing outside material owes them.
+            source = im.get("source")
+            if isinstance(source, dict) and source.get("label") and source.get("url"):
+                card["source"] = {
+                    "label": str(source["label"])[:80],
+                    "url": str(source["url"])[:500],
+                }
+            cards.append(card)
         return {"images": cards} if cards else None
     return None
 

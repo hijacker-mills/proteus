@@ -12,7 +12,7 @@ import logging
 
 import html
 import re
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from .. import config
 from ..httpclient import get_client
@@ -21,6 +21,9 @@ from .url_safety import is_safe_url_async, refusal
 logger = logging.getLogger("proteus.tools.web")
 
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+
+# Wikimedia asks API clients to identify themselves rather than pose as a browser.
+_WIKI_UA = "proteus-gateway/1.0 (https://ai-intelliq.com; study assistant)"
 
 
 def _strip_html(raw: str) -> str:
@@ -51,6 +54,89 @@ async def _brave(query: str, count: int) -> dict | None:
             "results": [{"title": x.get("title"), "url": x.get("url"),
                          "snippet": (x.get("description") or "")[:300]}
                         for x in (d.get("web", {}).get("results") or [])[:count]]}
+
+
+# Wikipedia answers "what is X", never "what is X right now". Its search also
+# always returns *something*, so without this a query about today matches an
+# unrelated article and the better source is never reached: "cheapest flights to
+# Accra next week" came back as "Northwest Airlines Flight 253".
+_RECENCY_RE = re.compile(
+    r"\b(today|tonight|tomorrow|yesterday|now|current(?:ly)?|latest|recent(?:ly)?|"
+    r"this (?:week|month|year)|next (?:week|month|year)|news|headlines|live|"
+    r"price|prices|cost|cheap(?:est)?|weather|forecast|score|scores|"
+    r"release notes|changelog|near me|20[2-9]\d)\b",
+    re.I,
+)
+
+# Words too common to prove a result is on topic.
+_STOPWORDS = frozenset(
+    "a an and are as at be by for from how in into is it of on or that the to "
+    "was what when where which who why with does do did can could would should "
+    "explain define definition example examples".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in _STOPWORDS}
+
+
+async def _wikipedia(query: str, count: int) -> dict | None:
+    """Keyless encyclopaedic search, ahead of scraping a search engine.
+
+    The keyless path used to be browser-driven SERP scraping alone, and on a
+    server IP that degrades badly: DuckDuckGo and Google answer this host with a
+    block page, leaving Bing, which ranked typing.com first for "type I error
+    statistics". Wikipedia's REST API has no key, no rate problem at this volume
+    and no IP block, and for the definitional and general-knowledge questions
+    that actually reach a tool like this it is the better source anyway.
+
+    Not a replacement for a real search API. It knows nothing about this week,
+    so anything asking about now, and anything whose best match isn't obviously
+    on topic, returns None and falls through to the engine below.
+    """
+    if _RECENCY_RE.search(query):
+        return None
+
+    r = await get_client().get(
+        "https://en.wikipedia.org/w/rest.php/v1/search/page", timeout=15,
+        params={"q": query, "limit": count},
+        headers={"User-Agent": _WIKI_UA, "Accept": "application/json"},
+    )
+    r.raise_for_status()
+    pages = (r.json() or {}).get("pages") or []
+
+    results = []
+    for p in pages[:count]:
+        title = p.get("title") or ""
+        if not title:
+            continue
+        # The excerpt arrives with <span class="searchmatch"> around each hit.
+        excerpt = _strip_html(p.get("excerpt") or "")
+        description = (p.get("description") or "").strip()
+        snippet = " — ".join(x for x in (description, excerpt) if x)[:300]
+        results.append({
+            "title": title,
+            "url": f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}",
+            "snippet": snippet,
+        })
+
+    if not results:
+        return None
+
+    # Wikipedia's search never says "nothing"; it says "here is the closest
+    # article", which for an off-topic query is a confident wrong answer. Require
+    # something in the result set to share a content word with what was asked.
+    #
+    # Checked across every result's title AND snippet, not just the top title:
+    # a right answer often doesn't repeat the question's words. "Who wrote the
+    # Iliad" ranks "Homer" first, which an overlap test on that title alone
+    # rejects, throwing away the correct answer for a worse source.
+    asked = _content_words(query)
+    if asked and not any(asked & _content_words(f"{r['title']} {r['snippet']}") for r in results):
+        return None
+
+    return {"provider": "wikipedia", "query": query, "results": results}
 
 
 async def _serper(query: str, count: int) -> dict | None:
@@ -143,7 +229,12 @@ async def _via_browser(query: str, count: int) -> dict:
 
 
 async def web_search(query: str, count: int = 5) -> dict:
-    """Keyed provider if one is configured, else a real browser."""
+    """A keyed provider if one is configured, then Wikipedia, then a real browser.
+
+    Wikipedia sits ahead of the browser rather than behind it because the
+    browser path is only as good as the one engine that will still answer this
+    host, and that engine is not good. See `_wikipedia`.
+    """
     query = (query or "").strip()
     if not query:
         return {"error": "query required"}
@@ -151,7 +242,8 @@ async def web_search(query: str, count: int = 5) -> dict:
 
     for key, provider in ((config.TAVILY_API_KEY, _tavily),
                           (config.BRAVE_SEARCH_API_KEY, _brave),
-                          (config.SERPER_API_KEY, _serper)):
+                          (config.SERPER_API_KEY, _serper),
+                          (True, _wikipedia)):
         if not key:
             continue
         try:
@@ -164,7 +256,7 @@ async def web_search(query: str, count: int = 5) -> dict:
 
     if config.TOOLS_BROWSER:
         return await _via_browser(query, count)
-    return {"error": "no search backend available — set TAVILY_API_KEY, "
+    return {"error": "no search backend available: set TAVILY_API_KEY, "
                      "BRAVE_SEARCH_API_KEY or SERPER_API_KEY, or enable TOOLS_BROWSER=true"}
 
 
