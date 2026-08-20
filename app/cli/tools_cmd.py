@@ -76,9 +76,10 @@ def list_tools(as_json: bool = typer.Option(False, "--json")) -> None:
 
     def render(d):
         if d["file_defined"]:
-            t = table("kind", "name", "target", "source")
+            t = table("kind", "name", "toolset", "target", "source")
             for r in d["file_defined"]:
-                t.add_row(r["kind"], f"[bold]{r['name']}[/]", r["target"][:52], r["source"])
+                t.add_row(r["kind"], f"[bold]{r['name']}[/]", r.get("toolset", "custom"),
+                          r["target"][:52], r["source"])
             out.print(t)
         else:
             out.print("[yellow]No file-defined tools.[/] Add one: proteus tool new <name> --http")

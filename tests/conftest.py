@@ -34,6 +34,7 @@ def tmp_agents(tmp_path, monkeypatch):
     directory = tmp_path / "agents"
     directory.mkdir()
     monkeypatch.setattr(agents_store, "AGENTS_DIR", directory)
+    monkeypatch.setattr(agents_store, "AGENTS_DIRS", [directory])
     agents_store.reset()
     yield directory
     agents_store.reset()
@@ -47,7 +48,32 @@ def tmp_tools(tmp_path, monkeypatch):
     directory = tmp_path / "tools"
     directory.mkdir()
     monkeypatch.setattr(declarative, "TOOLS_DIR", directory)
+    monkeypatch.setattr(declarative, "TOOLS_DIRS", [directory])
     yield directory
+
+
+@pytest.fixture
+def tmp_pack(tmp_path, monkeypatch):
+    """A mounted integration pack: its own agents/, tools/ and tools/custom/,
+    stacked AFTER this deployment's own directories exactly as PACKS does."""
+    from app import agents_store
+    from app.tools import declarative
+
+    pack = tmp_path / "pack"
+    own = tmp_path / "own"
+    for base in (pack, own):
+        (base / "agents").mkdir(parents=True)
+        (base / "tools" / "custom").mkdir(parents=True)
+
+    monkeypatch.setattr(agents_store, "AGENTS_DIR", own / "agents")
+    monkeypatch.setattr(agents_store, "AGENTS_DIRS", [own / "agents", pack / "agents"])
+    monkeypatch.setattr(declarative, "TOOLS_DIR", own / "tools")
+    monkeypatch.setattr(declarative, "TOOLS_DIRS", [own / "tools", pack / "tools"])
+    monkeypatch.setattr(declarative, "CUSTOM_DIRS",
+                        [own / "tools" / "custom", pack / "tools" / "custom"])
+    agents_store.reset()
+    yield pack, own
+    agents_store.reset()
 
 
 def write_agent(directory: Path, name: str, frontmatter: str, body: str = "You are a test agent.") -> Path:

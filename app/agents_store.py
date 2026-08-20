@@ -42,7 +42,10 @@ logger = logging.getLogger("proteus.agents")
 
 _APP_DIR = Path(__file__).parent
 _REPO_DIR = _APP_DIR.parent
-AGENTS_DIR = Path(config.AGENTS_DIR) if config.AGENTS_DIR else (_REPO_DIR / "agents")
+# Where `proteus agent new` writes; AGENTS_DIRS is everywhere definitions are
+# read from, this deployment's own directory first and mounted packs after.
+AGENTS_DIR = config.AGENTS_DIR
+AGENTS_DIRS = config.AGENTS_DIRS
 
 
 @dataclass
@@ -147,19 +150,33 @@ class EnvStore(AgentStore):
 
 
 class FileStore(AgentStore):
-    """agents/*.md on disk, re-read when a file changes."""
+    """agents/*.md on disk, re-read when a file changes.
 
-    def __init__(self, directory: Path) -> None:
-        self.dir = directory
+    Reads from several directories — this deployment's own, then each mounted
+    pack's — so an integration ships its agent without being merged into this
+    repo. Earlier directories win a name clash, and the clash is logged: an
+    agent silently replaced by one from a pack is a very confusing outage.
+    """
+
+    def __init__(self, directories: Path | list[Path]) -> None:
+        self.dirs = [directories] if isinstance(directories, Path) else list(directories)
         self._cache: dict[str, Agent] = {}
         self._stamp: float = -1.0
 
+    @property
+    def dir(self) -> Path:
+        """The primary directory — where new definitions are written."""
+        return self.dirs[0]
+
+    def _files(self) -> list[Path]:
+        return [p for d in self.dirs if d.is_dir() for p in sorted(d.glob("*.md"))]
+
     def _mtime(self) -> float:
-        if not self.dir.is_dir():
+        files = self._files()
+        if not files:
             return -1.0
-        stamps = [p.stat().st_mtime for p in self.dir.glob("*.md")]
         # Include the count so a deletion also busts the cache.
-        return max(stamps, default=0.0) + len(stamps)
+        return max(p.stat().st_mtime for p in files) + len(files)
 
     def version(self) -> float:
         return self._mtime()
@@ -168,20 +185,24 @@ class FileStore(AgentStore):
         stamp = self._mtime()
         if stamp != self._stamp:
             out: dict[str, Agent] = {}
-            for path in sorted(self.dir.glob("*.md")):
+            for path in self._files():
                 try:
                     agent = agent_from_markdown(
-                        path.read_text(encoding="utf-8"), path.stem, f"file:{path.name}")
+                        path.read_text(encoding="utf-8"), path.stem, f"file:{path}")
                 except Exception:
                     logger.exception("could not load agent %s", path)
                     continue
                 if not agent.prompt:
                     logger.warning("agent %s has an empty prompt body — skipping", path.name)
                     continue
+                if agent.name in out:
+                    logger.warning("agent %r is defined twice; keeping %s, ignoring %s",
+                                   agent.name, out[agent.name].source, path)
+                    continue
                 out[agent.name] = agent
             self._cache, self._stamp = out, stamp
-            logger.info("loaded %d agent(s) from %s: %s",
-                        len(out), self.dir, ", ".join(sorted(out)) or "none")
+            logger.info("loaded %d agent(s) from %s: %s", len(out),
+                        ", ".join(str(d) for d in self.dirs), ", ".join(sorted(out)) or "none")
         return self._cache
 
 
@@ -192,7 +213,7 @@ def store() -> AgentStore:
     """FileStore when agents/ has definitions, else the env-var layout."""
     global _store
     if _store is None:
-        fs = FileStore(AGENTS_DIR)
+        fs = FileStore(AGENTS_DIRS)
         _store = fs if fs.all() else EnvStore()
     return _store
 

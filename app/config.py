@@ -1,11 +1,54 @@
 """Environment-driven configuration. Loaded once at import."""
 from __future__ import annotations
 
+import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger("proteus.config")
+
+_APP_DIR = Path(__file__).parent
+_REPO_DIR = _APP_DIR.parent
+
+
+def _paths(key: str) -> list[Path]:
+    """A colon-separated path list, as PATH and FILES_ROOT are written."""
+    return [Path(p).expanduser() for p in os.environ.get(key, "").split(":") if p.strip()]
+
+
+# ── Integration packs ────────────────────────────────────────────────────────
+# An integration is agents + tools + its own secrets, and none of it belongs in
+# this repo. A pack is one directory laid out the way this one is:
+#
+#   <pack>/agents/*.md          agent definitions
+#   <pack>/tools/*.md           declarative HTTP tools
+#   <pack>/tools/custom/*.py    Python tools
+#   <pack>/.env                 the integration's own configuration
+#
+# `PACKS=/path/one:/path/two` mounts them. The pack's `.env` is loaded HERE,
+# before the rest of this module reads anything, and without `override` — so a
+# pack ships working defaults while the operator's own environment still wins.
+#
+# This is the whole extension mechanism: a product gets an agent and a toolset
+# on this gateway without a line of its vocabulary landing in the gateway.
+PACK_DIRS: list[Path] = []
+for _pack in _paths("PACKS"):
+    if not _pack.is_dir():
+        logger.warning("PACKS: %s is not a directory — skipping", _pack)
+        continue
+    PACK_DIRS.append(_pack.resolve())
+    _pack_env = _pack / ".env"
+    if _pack_env.is_file():
+        load_dotenv(_pack_env, override=False)
+
+
+def _pack_dirs(subdir: str) -> list[Path]:
+    """`<pack>/<subdir>` for every mounted pack that actually has one."""
+    return [d for d in (p / subdir for p in PACK_DIRS) if d.is_dir()]
 
 
 def _int(key: str, default: int) -> int:
@@ -146,12 +189,24 @@ TOOLSET = os.environ.get("TOOLSET", "none").strip()
 # Definitions live in agents/*.md. This names the one to use when a request
 # doesn't ask for a specific agent.
 DEFAULT_PROFILE = os.environ.get("DEFAULT_PROFILE", "assistant").strip()
-# Directory of agent definitions (agents/*.md). Empty = <repo>/agents. When it
-# holds no definitions, one agent is assembled from SYSTEM_PROMPT_FILE + TOOLSET
-# so the gateway still serves instead of refusing to start.
-AGENTS_DIR = os.environ.get("AGENTS_DIR", "").strip()
-# Directory of declarative HTTP tools (tools/*.md). Empty = <repo>/tools.
-TOOLS_DIR = os.environ.get("TOOLS_DIR", "").strip()
+# Where definitions are read from. Each is the built-in location (or an explicit
+# override) followed by whatever the mounted packs contribute. Searched in
+# order, and the first definition of a name wins — so mounting a pack can never
+# quietly replace an agent or tool this deployment already had.
+#
+# The first entry is also where `proteus agent new` / `tool new` write, which is
+# why it stays a single directory rather than a list.
+AGENTS_DIR = Path(os.environ.get("AGENTS_DIR", "").strip() or _REPO_DIR / "agents")
+AGENTS_DIRS: list[Path] = [AGENTS_DIR, *_pack_dirs("agents")]
+
+TOOLS_DIR = Path(os.environ.get("TOOLS_DIR", "").strip() or _REPO_DIR / "tools")
+TOOLS_DIRS: list[Path] = [TOOLS_DIR, *_pack_dirs("tools")]
+
+# Python tools. The built-in directory is inside the package; packs keep theirs
+# beside their declarative tools, under `tools/custom`.
+CUSTOM_TOOLS_DIR = Path(
+    os.environ.get("CUSTOM_TOOLS_DIR", "").strip() or _APP_DIR / "tools" / "custom")
+CUSTOM_TOOLS_DIRS: list[Path] = [CUSTOM_TOOLS_DIR, *_pack_dirs("tools/custom")]
 
 # ── Agent tools ──────────────────────────────────────────────────────────────
 # Search providers, tried in this order. With none set, web_search drives the

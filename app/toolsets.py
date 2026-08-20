@@ -8,10 +8,13 @@ merges the tools from each and routes every tool call to the toolset that owns i
   "web"     → web_search, web_fetch, browser              (no host access)
   "agent"   → the web tools + run_code, shell, email, schedule (each gated)
   "custom"  → your own: tools/*.md and app/tools/custom/*.py
+  <other>   → file-defined tools carrying `toolset: <other>`
 
 e.g. `toolset: [web, custom]` exposes both. Add a built-in toolset by
 registering its (schemas, dispatch) in _provider(); add your own tools as files
-and they appear under "custom" with no code change.
+and they appear under "custom" with no code change, or under a name of their
+own if they claim one — which is how one gateway serves several products
+without any agent seeing another's tools.
 """
 from __future__ import annotations
 
@@ -93,8 +96,15 @@ def _provider(name: str) -> tuple[list[dict], DispatchFn] | None:
         # File-defined tools: tools/*.md (HTTP) and app/tools/custom/*.py.
         # Never host tools — see declarative.py for why.
         from .tools import declarative
-        return declarative.load()
-    return None
+        return declarative.load(declarative.DEFAULT_GROUP)
+
+    # Any other name is a group of file-defined tools that tagged themselves
+    # with it (`toolset: <name>` in a tool file). So a deployment adds a whole
+    # new toolset by writing files — no edit here, and no domain vocabulary in
+    # the core. Returns None when nothing claims the name, which reads to
+    # load_for() as "toolset doesn't exist" exactly as it did before.
+    from .tools import declarative
+    return declarative.load(name)
 
 
 def load() -> tuple[list[dict] | None, DispatchFn]:

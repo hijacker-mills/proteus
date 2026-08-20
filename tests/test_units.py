@@ -202,6 +202,130 @@ def test_declarative_tool_cannot_shadow_a_host_tool(tmp_tools):
     assert "error" in asyncio.run(dispatch("shell", "u", {}))
 
 
+def test_omitted_argument_drops_its_key(tmp_tools):
+    """An optional parameter the model didn't supply must not be sent as "",
+    which the backend would take as a value and use instead of its default."""
+    from app.tools import declarative
+
+    (tmp_tools / "t.md").write_text(
+        "---\nname: t\nurl: https://api.example.com/x\n"
+        "body:\n  query: '{{query}}'\n  limit: '{{limit}}'\n"
+        "params:\n  query: {type: string}\n  limit: {type: integer}\n---\nx",
+        encoding="utf-8")
+    tool = declarative._load_http_tools()["t"]
+    assert declarative._fill(tool.meta["body"], {"query": "hi"}) == {"query": "hi"}
+    # …and a supplied one keeps its type, so `limit` arrives as a number.
+    assert declarative._fill(tool.meta["body"], {"query": "hi", "limit": 3}) == \
+        {"query": "hi", "limit": 3}
+
+
+def test_env_var_in_url_is_expanded_at_load(tmp_tools, monkeypatch):
+    from app.tools import declarative
+
+    monkeypatch.setenv("TEST_BACKEND", "https://backend.example.com")
+    (tmp_tools / "e.md").write_text(
+        "---\nname: e\nurl: ${TEST_BACKEND}/api/x\n---\nx", encoding="utf-8")
+    assert declarative._load_http_tools()["e"].url == "https://backend.example.com/api/x"
+
+
+def test_url_with_an_unset_env_var_is_rejected(tmp_tools):
+    """Better to lose the tool loudly at startup than to fail every call."""
+    from app.tools import declarative
+
+    (tmp_tools / "e.md").write_text(
+        "---\nname: e\nurl: ${DEFINITELY_NOT_SET}/api/x\n---\nx", encoding="utf-8")
+    assert "e" not in declarative._load_http_tools()
+
+
+def test_tools_can_claim_their_own_toolset(tmp_tools):
+    """A tool tagged `toolset:` stays out of the default `custom` bucket, so a
+    pack's tools never appear in an agent that didn't ask for them."""
+    from app import toolsets
+
+    (tmp_tools / "mine.md").write_text(
+        "---\nname: mine\ntoolset: acme\nurl: https://api.example.com/x\n---\nx", encoding="utf-8")
+    (tmp_tools / "shared.md").write_text(
+        "---\nname: shared\nurl: https://api.example.com/y\n---\ny", encoding="utf-8")
+
+    acme, _ = toolsets.load_for("acme")
+    custom, _ = toolsets.load_for("custom")
+    assert {t["function"]["name"] for t in acme} == {"mine"}
+    assert "mine" not in {t["function"]["name"] for t in custom}
+    assert "shared" in {t["function"]["name"] for t in custom}
+    assert toolsets.load_for("nobody_claims_this")[0] is None
+
+
+# ── integration packs ────────────────────────────────────────────────────────
+
+def test_pack_contributes_agents_and_tools(tmp_pack):
+    from app import agents_store, toolsets
+    from tests.conftest import write_agent
+
+    pack, own = tmp_pack
+    write_agent(own / "agents", "assistant", "name: assistant")
+    write_agent(pack / "agents", "qubi", "name: qubi\ntoolset: [acme]")
+    (pack / "tools" / "packed.md").write_text(
+        "---\nname: packed\ntoolset: acme\nurl: https://api.example.com/x\n---\nx",
+        encoding="utf-8")
+
+    agents = agents_store.store().all()
+    assert set(agents) == {"assistant", "qubi"}
+    assert agents["qubi"].toolset == "acme"
+    assert {t["function"]["name"] for t in toolsets.load_for("acme")[0]} == {"packed"}
+
+
+def test_a_pack_cannot_silently_replace_an_existing_agent(tmp_pack):
+    """First directory wins. A pack quietly shadowing the assistant an operator
+    already runs is an outage that looks like nothing happened."""
+    from app import agents_store
+    from tests.conftest import write_agent
+
+    pack, own = tmp_pack
+    write_agent(own / "agents", "assistant", "name: assistant\ndescription: mine")
+    write_agent(pack / "agents", "assistant", "name: assistant\ndescription: theirs")
+
+    assert agents_store.store().all()["assistant"].description == "mine"
+
+
+def test_pack_python_tools_load_and_may_define_several(tmp_pack):
+    from app import toolsets
+
+    pack, _ = tmp_pack
+    (pack / "tools" / "custom" / "pair.py").write_text(
+        'TOOLSET = "acme"\n'
+        'def _schema(n):\n'
+        '    return {"type": "function", "function": {"name": n, "description": n,\n'
+        '            "parameters": {"type": "object", "properties": {}}}}\n'
+        'async def _one(user_id, args): return {"who": "one"}\n'
+        'async def _two(user_id, args): return {"who": "two"}\n'
+        'TOOLS = [(_schema("one"), _one), (_schema("two"), _two)]\n',
+        encoding="utf-8")
+
+    tools, dispatch = toolsets.load_for("acme")
+    assert {t["function"]["name"] for t in tools} == {"one", "two"}
+    assert asyncio.run(dispatch("two", "u", {})) == {"who": "two"}
+
+
+def test_pack_python_tool_can_import_its_own_helper(tmp_pack):
+    """`_`-prefixed files are helpers, not tools — and must be importable."""
+    from app import toolsets
+
+    pack, _ = tmp_pack
+    custom = pack / "tools" / "custom"
+    (custom / "_shared.py").write_text("ANSWER = 42\n", encoding="utf-8")
+    (custom / "uses_helper.py").write_text(
+        'from _shared import ANSWER\n'
+        'TOOLSET = "acme"\n'
+        'SCHEMA = {"type": "function", "function": {"name": "helped", "description": "x",\n'
+        '          "parameters": {"type": "object", "properties": {}}}}\n'
+        'async def handler(user_id, args): return {"answer": ANSWER}\n',
+        encoding="utf-8")
+
+    tools, dispatch = toolsets.load_for("acme")
+    assert {t["function"]["name"] for t in tools} == {"helped"}
+    assert asyncio.run(dispatch("helped", "u", {})) == {"answer": 42}
+
+
 # ── prompt cache breakpoint ──────────────────────────────────────────────────
 
 def test_cache_breakpoint_splits_stable_from_volatile():

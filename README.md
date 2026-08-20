@@ -217,6 +217,8 @@ comments in [`.env.example`](.env.example); the essentials:
 | `SYSTEM_PROMPT_FILE` | `prompts/assistant.md` | Persona for the `assistant` profile, relative to `app/`. |
 | `TOOLSET` | `none` | Fallback toolset when there is no `agents/` dir. Comma list: `none` / `basics` / `web` / `agent` / `custom`. |
 | `DEFAULT_PROFILE` | `assistant` | Used when a request names no profile. |
+| `PACKS` | *(empty)* | Colon-separated [integration packs](#building-an-integration) to mount: each contributes `agents/`, `tools/`, `tools/custom/` and its own `.env`. |
+| `AGENTS_DIR` / `TOOLS_DIR` / `CUSTOM_TOOLS_DIR` | `agents` / `tools` / `app/tools/custom` | This deployment's own definitions, searched before any pack's. Also where `proteus agent new` and `tool new` write. |
 | `TOOLS_BROWSER` | `true` | Real headless-Chrome tool (via the `pw-control` CLI). |
 | `TOOLS_CODE_EXEC` / `TOOLS_SHELL` / `TOOLS_EMAIL` | `false` | Host-access tools — read [Security](#security-model) first. |
 | `TAVILY_API_KEY` | *(empty)* | Better web search; falls back to keyless DuckDuckGo. |
@@ -684,20 +686,48 @@ they were created from.
 ## Building an integration
 
 A real integration is a set of tools plus an agent that knows how to use them,
-and neither needs to live in this repo. The pattern:
+and none of it lives in this repo. Put it in a **pack** — one directory laid out
+the way this one is:
+
+```
+your-integration/
+  agents/qubi.md              the persona, its toolset, and any modes
+  tools/lecture_evidence.md   an HTTP call: no Python at all
+  tools/custom/memory.py      anything with real logic
+  .env                        the integration's own configuration
+```
+
+Mount it with one line, and more than one if you have more than one:
+
+```bash
+PACKS=/srv/your-integration          # colon-separated for several
+```
+
+Three things make that enough:
 
 1. **Tools.** Anything that is an HTTP call is a `tools/*.md` file, with
    `send_user_header` passing the gateway-resolved user id to your backend so it
-   can scope the response. Anything with real logic is a Python module in
-   `app/tools/custom/`. Both load automatically under the `custom` toolset.
-2. **An agent.** One `agents/<name>.md` naming that toolset, with its persona in
-   the body and any [modes](#modes) in the frontmatter.
-3. **Point at them.** `AGENTS_DIR` and `TOOLS_DIR` can live anywhere on disk, so
-   your integration can be its own repo, mounted or checked out beside this one.
+   can scope the response, and `${VAR}` for the base URL and any secret.
+   Anything with real logic is a Python module exporting `SCHEMA` + `handler`
+   (or `TOOLS` for several at once). A `_`-prefixed file is a helper, importable
+   by its neighbours and never loaded as a tool.
+2. **A toolset of your own.** Tag each tool `toolset: <name>` (Python:
+   `TOOLSET = "<name>"`) and name it from the agent's frontmatter. Untagged
+   tools land in `custom`, which every agent using custom tools receives — fine
+   for a single deployment, wrong the moment two products share a gateway.
+3. **Your own configuration.** The pack's `.env` is loaded when it is mounted,
+   without overriding anything already set, so it ships working defaults while
+   the operator keeps the last word. Your secrets stay in your repo, not in the
+   gateway's env file.
+
+Definitions are read from this deployment's directories first and each pack's
+after, and the first definition of a name wins — mounting a pack can't quietly
+replace an agent you already run. A clash is logged rather than silently
+resolved.
 
 Nothing about your domain ends up in the gateway. The one integration this was
-extracted from (a study companion, nine tools against a host app) is now exactly
-this: files in another repo, and the gateway does not know it exists.
+extracted from (a study companion, nine tools against a host app) is exactly
+this: a pack in another repo, and the gateway does not know it exists.
 
 ## Deploying
 

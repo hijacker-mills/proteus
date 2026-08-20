@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import typer
 
@@ -34,6 +35,16 @@ def _store():
 
     agents_store.reset()          # always read from disk; the CLI is short-lived
     return agents_store
+
+
+def _path_for(store, name: str) -> Path:
+    """The file backing an agent — which may belong to a mounted pack rather
+    than this deployment's own directory. Falls back to where a file of that
+    name WOULD go, so callers can report a sensible "does not exist"."""
+    agent = store.store().get(name)
+    if agent and agent.source.startswith("file:"):
+        return Path(agent.source[len("file:"):])
+    return store.AGENTS_DIR / f"{name}.md"
 
 
 def _describe(agent, with_tools: bool = True) -> dict:
@@ -141,7 +152,7 @@ def new(name: str,
 def edit(name: str) -> None:
     """Open agents/<name>.md in $EDITOR, then validate it."""
     store = _store()
-    path = store.AGENTS_DIR / f"{name}.md"
+    path = _path_for(store, name)
     if not path.exists():
         die(f"{path} does not exist", f"Create it:  proteus agent new {name}")
 
@@ -198,9 +209,12 @@ def validate(name: str = typer.Argument(None, help="Agent to check; omit for all
 def rm(name: str, yes: bool = typer.Option(False, "--yes", "-y")) -> None:
     """Delete agents/<name>.md."""
     store = _store()
-    path = store.AGENTS_DIR / f"{check_name(name, 'agent')}.md"
+    path = _path_for(store, check_name(name, "agent"))
     if not path.exists():
         die(f"{path} does not exist")
+    if path.parent != store.AGENTS_DIR:
+        err.print(f"[yellow]warning:[/] {name} belongs to a mounted pack ({path.parent}), "
+                  f"not this deployment")
     if not yes and not confirm_tty(f"Delete {path}?"):
         raise typer.Exit(1)
     path.unlink()

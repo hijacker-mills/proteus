@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Integration packs.** `PACKS=/srv/thing` mounts a directory of `agents/`,
+  `tools/`, `tools/custom/` and its own `.env`, so an integration is its own
+  repo rather than a fork of this one. Definitions from this deployment are
+  searched first and a name clash is logged, so a pack can't silently replace an
+  agent you already run.
+- **Tools can claim a toolset.** `toolset: <name>` in a tool file (`TOOLSET` in
+  a Python one) puts it in a toolset agents ask for by name, instead of the
+  shared `custom` bucket every agent using custom tools receives.
+- **A Python tool file can define several tools** via `TOOLS = [(schema,
+  handler), …]`, and can import its `_`-prefixed neighbours as helpers.
+- Declarative tools take an optional per-tool `timeout:`, and expand `${VAR}` in
+  `url` so a backend's address is configuration rather than a committed literal.
+
+### Fixed
+- An optional declarative-tool parameter the model didn't supply was sent as an
+  empty string, overriding the backend's own default — an omitted `limit`
+  arrived as a limit of 1. The key is now dropped, and a supplied argument keeps
+  its type instead of being stringified.
+
 ## 0.2.0
 
 Renamed from ACAG. Many agents, one gateway.
