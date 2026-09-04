@@ -201,7 +201,8 @@ comments in [`.env.example`](.env.example); the essentials:
 | `MAX_TOKENS` / `TEMPERATURE` | `1500` / `0.3` | Ignored by providers that don't accept them. |
 | `REQUEST_TIMEOUT` / `LLM_RETRIES` | `300` / `2` | Ceiling on one completion; retries for transient 429/5xx. |
 | `MAX_CONCURRENT_COMPLETIONS` | `64` | In-flight completions **per worker**, so the real cap is this × `WORKERS`. Over it, `503` + `Retry-After`. `0` disables. |
-| `RATE_LIMIT_PER_MINUTE` | `0` | Per-**user** ceiling, also per worker. `429` + `Retry-After`. `0` disables. |
+| `RATE_LIMIT_PER_MINUTE` | `30` | Per-**user** ceiling, also per worker. `429` + `Retry-After`. `0` disables. This changes the previous unlimited default. |
+| `PROTEUS_IDENTITY_SECRET` | *(empty)* | HMAC secret shared with the authenticated backend to prevent user-ID impersonation. Sign `user_id:unix_seconds` with HMAC-SHA256 and send the lowercase hex digest in `X-Proteus-Identity-Signature`, plus `X-Proteus-Identity-Timestamp`. Past timestamps are accepted for 300 seconds; future timestamps only 60 seconds. Required for production Qubi traffic. |
 | `API_KEYS` | *(empty)* | `web:key1,mobile:key2` — named keys, revocable one at a time. |
 | `METRICS_ENABLED` / `METRICS_PUBLIC` | `true` / `false` | `/metrics`, behind API-key auth by default. |
 | `CONCURRENCY_WAIT` | `20` | Seconds a request waits for a slot before being shed. |

@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 import httpx
+from ..identity import signed_headers
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -161,7 +162,7 @@ class ProteusTUI(App):
     def ask(self, _text: str) -> None:
         """Stream one turn. In a thread, so the UI keeps repainting."""
         headers = {"Authorization": f"Bearer {self.key}",
-                   "X-Proteus-User-Id": self.user,
+                   **signed_headers(self.user),
                    "X-Proteus-Profile": self.current or ""}
         body = {"stream": True, "messages": self.history}
         parts: list[str] = []

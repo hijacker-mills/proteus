@@ -64,6 +64,75 @@ def test_empty_prompt_is_skipped(tmp_agents):
     assert "hollow" not in agents_store.store().all()
 
 
+def test_signed_identity_proof_is_required_and_verified(monkeypatch):
+    from app import config, main
+    import hashlib
+    import hmac
+    import time
+
+    secret = "s" * 32
+    monkeypatch.setattr(config, "PROTEUS_IDENTITY_SECRET", secret)
+    user_id = "user-123"
+    timestamp = str(int(time.time()))
+    signature = hmac.new(
+        secret.encode(), f"{user_id}:{timestamp}".encode(), hashlib.sha256
+    ).hexdigest()
+
+    main._verify_identity(user_id, timestamp, signature)
+
+    with pytest.raises(Exception, match="invalid user identity proof"):
+        main._verify_identity(user_id, timestamp, "0" * 64)
+
+
+def test_signed_identity_proof_rejects_expired_timestamp(monkeypatch):
+    from app import config, main
+    import hashlib
+    import hmac
+    import time
+
+    secret = "s" * 32
+    monkeypatch.setattr(config, "PROTEUS_IDENTITY_SECRET", secret)
+    timestamp = str(int(time.time()) - 301)
+    signature = hmac.new(
+        secret.encode(), f"user-123:{timestamp}".encode(), hashlib.sha256
+    ).hexdigest()
+
+    with pytest.raises(Exception, match="expired user identity proof"):
+        main._verify_identity("user-123", timestamp, signature)
+
+
+def test_signed_identity_proof_rejects_missing_and_future_headers(monkeypatch):
+    from app import config, main
+    import time
+
+    monkeypatch.setattr(config, "PROTEUS_IDENTITY_SECRET", "s" * 32)
+
+    with pytest.raises(Exception, match="missing user identity proof"):
+        main._verify_identity("user-123", None, None)
+
+    with pytest.raises(Exception, match="future-dated user identity proof"):
+        main._verify_identity("user-123", str(int(time.time()) + 61), "0" * 64)
+
+
+def test_signed_identity_helper_round_trips_and_binds_user(monkeypatch):
+    from app import config, identity, main
+
+    monkeypatch.setattr(config, "PROTEUS_IDENTITY_SECRET", "s" * 32)
+    headers = identity.signed_headers(" user-123 ")
+    main._verify_identity(
+        "user-123",
+        headers["X-Proteus-Identity-Timestamp"],
+        headers["X-Proteus-Identity-Signature"].upper(),
+    )
+
+    with pytest.raises(Exception, match="invalid user identity proof"):
+        main._verify_identity(
+            "user-456",
+            headers["X-Proteus-Identity-Timestamp"],
+            headers["X-Proteus-Identity-Signature"],
+        )
+
+
 def test_modes_come_from_the_agent(tmp_agents):
     from app import agents_store
 

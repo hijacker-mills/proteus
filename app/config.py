@@ -88,11 +88,15 @@ API_KEYS = _parse_keys(os.environ.get("API_KEYS", ""))
 if API_KEY:
     API_KEYS.setdefault(API_KEY, "default")
 
+# Short-lived HMAC proof from the authenticated application backend. This keeps
+# a bearer gateway token from being enough to impersonate another user.
+PROTEUS_IDENTITY_SECRET = os.environ.get("PROTEUS_IDENTITY_SECRET", "").strip()
+
 # Per-user request ceiling, PER WORKER (so the real limit is this x WORKERS).
 # 0 disables. The bucket permits a burst up to RATE_LIMIT_BURST, defaulting to
 # one minute's worth, because a few rapid turns is normal use and a sustained
 # flood is not.
-RATE_LIMIT_PER_MINUTE = _int("RATE_LIMIT_PER_MINUTE", 0)
+RATE_LIMIT_PER_MINUTE = _int("RATE_LIMIT_PER_MINUTE", 30)
 RATE_LIMIT_BURST = _int("RATE_LIMIT_BURST", 0) or None
 
 # Server

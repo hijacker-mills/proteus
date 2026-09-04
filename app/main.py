@@ -21,6 +21,8 @@ the operator's allowlisted Telegram bot (see channels/base.py).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -113,6 +115,8 @@ async def _db_ready() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if config.API_KEYS and not config.PROTEUS_IDENTITY_SECRET:
+        logger.warning("PROTEUS_IDENTITY_SECRET is unset; user identity headers are not signed")
     # The database is optional here: chat is stateless, so an outage must not
     # take the gateway down with it. Boot degraded and heal in the background.
     if await db.try_init_pool():
@@ -178,6 +182,28 @@ def _resolve_user_id(body: dict[str, Any], header_uid: str | None) -> str | None
             if match:
                 return match.group(1)
     return None
+
+
+def _verify_identity(user_id: str, timestamp: str | None, signature: str | None) -> None:
+    """Verify the authenticated backend's short-lived user identity proof."""
+    secret = config.PROTEUS_IDENTITY_SECRET
+    if not secret:
+        return
+    if not timestamp or not signature:
+        raise HTTPException(status_code=401, detail="missing user identity proof")
+    try:
+        issued_at = int(timestamp.strip())
+    except ValueError:
+        raise HTTPException(status_code=401, detail="invalid user identity proof")
+    now = int(time.time())
+    if issued_at - now > 60:
+        raise HTTPException(status_code=401, detail="future-dated user identity proof")
+    if now - issued_at > 300:
+        raise HTTPException(status_code=401, detail="expired user identity proof")
+    message = f"{user_id}:{issued_at}".encode()
+    expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature.strip().lower()):
+        raise HTTPException(status_code=401, detail="invalid user identity proof")
 
 
 def _resolve_profile(body: dict[str, Any], header_profile: str | None) -> str | None:
@@ -380,6 +406,8 @@ async def chat_completions(
     x_proteus_user_id: str | None = Header(default=None),
     x_proteus_profile: str | None = Header(default=None),
     x_proteus_mode: str | None = Header(default=None),
+    x_proteus_identity_timestamp: str | None = Header(default=None),
+    x_proteus_identity_signature: str | None = Header(default=None),
     x_proteus_admin_key: str | None = Header(default=None),
 ):
     tenant = _check_auth(authorization)
@@ -391,6 +419,7 @@ async def chat_completions(
     user_id = _resolve_user_id(body, x_proteus_user_id)
     if not user_id:
         raise HTTPException(status_code=400, detail="missing user id (X-Proteus-User-Id header, 'user' field, or a 'user_id: <id>' system message)")
+    _verify_identity(user_id, x_proteus_identity_timestamp, x_proteus_identity_signature)
 
     # Profile selects persona + toolset (header / body.profile / session_key prefix).
     profile = _resolve_profile(body, x_proteus_profile)

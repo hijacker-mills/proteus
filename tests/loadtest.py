@@ -18,6 +18,8 @@ import time
 
 import httpx
 
+from app.identity import signed_headers
+
 USERS = ["loadtest-1", "loadtest-2", "loadtest-3", "loadtest-4"]
 PROMPTS = [
     "Give me one quick productivity tip. Be brief.",
@@ -32,7 +34,7 @@ async def one(client: httpx.AsyncClient, base: str, api_key: str, i: int) -> tup
     try:
         r = await client.post(
             f"{base}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "X-Proteus-User-Id": USERS[i % len(USERS)]},
+            headers={"Authorization": f"Bearer {api_key}", **signed_headers(USERS[i % len(USERS)])},
             json={"messages": [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}]},
         )
         ok = r.status_code == 200 and bool(r.json()["choices"][0]["message"]["content"])

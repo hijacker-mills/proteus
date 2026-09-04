@@ -12,6 +12,7 @@ import typer
 
 from . import agents as agents_cmd
 from . import auth_cmd, ops_cmd, tools_cmd
+from ..identity import signed_headers
 from ._common import (REPO, api_key, base_url, die, emit, err, get_json,
                       load_env, out, table, try_json, version)
 
@@ -109,11 +110,14 @@ def chat(agent: str = typer.Argument(None, help="Agent to talk to; omit for the 
     import httpx
 
     base = base_url(remote)
-    hdr = {"Authorization": f"Bearer {api_key()}", "X-Proteus-User-Id": user}
     if agent:
-        hdr["X-Proteus-Profile"] = agent
+        profile_header = agent
+    else:
+        profile_header = None
     if mode:
-        hdr["X-Proteus-Mode"] = mode
+        mode_header = mode
+    else:
+        mode_header = None
 
     history: list[dict] = []
     out.print(f"[dim]{base}  agent={agent or 'default'}  user={user}"
@@ -145,6 +149,11 @@ def chat(agent: str = typer.Argument(None, help="Agent to talk to; omit for the 
             history.append({"role": "user", "content": msg})
             reply, t0, first = [], time.time(), None
             try:
+                hdr = {"Authorization": f"Bearer {api_key()}", **signed_headers(user)}
+                if profile_header:
+                    hdr["X-Proteus-Profile"] = profile_header
+                if mode_header:
+                    hdr["X-Proteus-Mode"] = mode_header
                 with client.stream("POST", f"{base}/v1/chat/completions", headers=hdr,
                                    json={"stream": True, "messages": history}) as r:
                     if r.status_code != 200:
@@ -207,7 +216,7 @@ def bench(concurrency: int = typer.Option(20, "--concurrency", "-c"),
 
     async def one(client, i: int) -> tuple[bool, float]:
         t0 = time.time()
-        hdr = {"Authorization": f"Bearer {key}", "X-Proteus-User-Id": f"bench-{i % 50}"}
+        hdr = {"Authorization": f"Bearer {key}", **signed_headers(f"bench-{i % 50}")}
         body: dict = {"messages": [{"role": "user", "content": "hello"}]}
         try:
             if stream:
