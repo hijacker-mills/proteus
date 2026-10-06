@@ -11,6 +11,8 @@ right way round — the frontmatter carries the config, the body IS the prompt:
     model: null          # null / omitted = inherit MODEL
     fallbacks: []        # models to try, in order, if `model` fails
     max_tokens: 1500
+    tool_rounds: 4       # omitted = MAX_TOOL_TURNS
+    tool_time_budget: 45 # seconds into a reply before it must answer; omitted = TOOL_TIME_BUDGET
     ---
 
     You are a support agent for Acme…
@@ -72,6 +74,11 @@ class Agent:
     # for one by name (X-Proteus-Mode). The gateway supplies the MECHANISM; the
     # agent supplies the CONTENT, so no domain vocabulary lives in the core.
     modes: dict[str, str] = field(default_factory=dict)
+    # How many rounds of tool calls one reply may make, and how many seconds it
+    # may run, before it stops calling tools and answers from what it has.
+    # None means the gateway's MAX_TOOL_TURNS / TOOL_TIME_BUDGET.
+    tool_rounds: int | None = None
+    tool_time_budget: int | None = None
     source: str = "env"                       # where it came from, for `proteus agent list`
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -119,10 +126,25 @@ def _str_list(value: Any) -> list[str]:
     return [s for s in (str(v).strip() for v in items) if s]
 
 
+def _positive_int(meta: dict[str, Any], key: str, name: str) -> int | None:
+    """A positive whole number from frontmatter, or None (logged) when it is not one."""
+    if meta.get(key) is None:
+        return None
+    try:
+        value = int(meta[key])
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        logger.warning("agent %s: invalid %s %r, ignoring", name or "?", key, meta[key])
+        return None
+    return value
+
+
 def agent_from_markdown(text: str, name: str, source: str) -> Agent:
     meta, body = parse_markdown(text, name_hint=name)
     known = {"name", "description", "toolset", "model", "fallbacks", "max_tokens",
-             "reasoning_max_tokens", "reasoning_effort", "modes"}
+             "reasoning_max_tokens", "reasoning_effort", "modes", "tool_rounds",
+             "tool_time_budget"}
     effort = str(meta.get("reasoning_effort") or "").strip().lower() or None
     if effort and effort not in {"minimal", "low", "medium", "high"}:
         logger.warning("agent %s: invalid reasoning_effort %r — ignoring",
@@ -141,6 +163,8 @@ def agent_from_markdown(text: str, name: str, source: str) -> Agent:
         reasoning_effort=effort,
         modes={str(k).strip().lower(): str(v).strip()
                for k, v in (meta.get("modes") or {}).items() if str(v).strip()},
+        tool_rounds=_positive_int(meta, "tool_rounds", name),
+        tool_time_budget=_positive_int(meta, "tool_time_budget", name),
         source=source,
         extra={k: v for k, v in meta.items() if k not in known},
     )

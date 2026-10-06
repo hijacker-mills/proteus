@@ -32,7 +32,7 @@ second_pass_messages: list[list[dict]] = []
 
 
 def make_astream():
-    async def fake_astream(model, messages, tools, max_tokens, temperature, reasoning_effort=None):
+    async def fake_astream(model, messages, tools, max_tokens, temperature, reasoning_effort=None, **_):
         if any(m.get("role") == "tool" for m in messages):
             second_pass_messages.append(list(messages))       # what the model actually sees
             yield {"type": "text", "text": "done"}

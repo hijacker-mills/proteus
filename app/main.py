@@ -290,6 +290,8 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
     t0 = time.time()
     ttft: float | None = None
     tools_used = 0
+    tool_names: list[str] = []
+    budget_spent = False
     usage: dict[str, int] = {}
     finish_reason: str | None = None
     # Profile's primary model until a fallback (or tool loop) reports otherwise.
@@ -342,6 +344,7 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
                 yield _chunk(chat_id, created, model=response_model, tool_event=ev["event"])
             elif ev["type"] == "tool":
                 tools_used += 1
+                tool_names.append(str(ev["event"].get("tool") or "?"))
                 out = _flush()          # ordering: text before its tool event
                 if out:
                     yield out
@@ -358,6 +361,7 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
                 usage = ev["usage"]
             elif ev["type"] == "done":
                 finish_reason = ev.get("finish_reason") or finish_reason
+                budget_spent = bool(ev.get("tool_budget_spent"))
                 if ev.get("model"):
                     response_model = ev["model"]
                 break
@@ -372,14 +376,15 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
     finally:
         _limiter.release()
         _record(tenant, "stream", time.time() - t0, ttft, usage, tools_used)
-        logger.info("stream user=%s tenant=%s profile=%s ttft=%s total=%.0fms tools=%d "
-                    "tokens=%d/%d%s inflight=%d",
+        logger.info("stream user=%s tenant=%s profile=%s ttft=%s total=%.0fms tools=%d%s "
+                    "tokens=%d/%d%s inflight=%d%s",
                     user_id, tenant, profile or config.DEFAULT_PROFILE,
                     f"{ttft*1000:.0f}ms" if ttft else "none",
                     (time.time() - t0) * 1000, tools_used,
+                    f" [{','.join(tool_names)}]" if tool_names else "",
                     usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
                     f" cached={usage['cached_tokens']}" if usage.get("cached_tokens") else "",
-                    _limiter.in_use)
+                    _limiter.in_use, " tool_budget=spent" if budget_spent else "")
 
 
 async def _collect(user_id: str, body: dict[str, Any], profile: str | None = None,

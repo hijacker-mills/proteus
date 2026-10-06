@@ -115,6 +115,11 @@ MAX_TOKENS = _int("MAX_TOKENS", 1500)
 # (the default); an agent's `reasoning_max_tokens:` frontmatter overrides this.
 REASONING_MAX_TOKENS = _int("REASONING_MAX_TOKENS", 0)
 MAX_TOOL_TURNS = _int("MAX_TOOL_TURNS", 8)
+# Seconds into a reply after which it stops calling tools and answers from what
+# it has. 0 = no time limit, only MAX_TOOL_TURNS. An agent's
+# `tool_time_budget:` frontmatter overrides this, and `tool_rounds:` overrides
+# MAX_TOOL_TURNS.
+TOOL_TIME_BUDGET = _int("TOOL_TIME_BUDGET", 0)
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.3") or 0.3)
 # Hard ceiling on one upstream completion. A reasoning model on a long answer can
 # legitimately run minutes, so this is generous; its job is to stop a *stalled*

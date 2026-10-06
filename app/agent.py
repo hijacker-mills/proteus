@@ -26,6 +26,17 @@ from typing import Any, AsyncGenerator
 
 from . import config, events, llm, profiles
 
+# Added as the last message once a run is out of tool rounds or tool time, for
+# the one call that must answer with what it has.
+_ANSWER_NOW = (
+    "You have used all the tool calls this reply allows. Do not call any more "
+    "tools. Answer the user now from what you already have, and say in one short "
+    "line what you could not check."
+)
+# Only reached when even that call produced no text.
+_GAVE_UP = ("_(That took more lookups than I can do in one reply. Ask again "
+            "with a narrower question and I'll finish the job.)_")
+
 
 def _prepare(messages: list[dict[str, Any]], extra_system: str, system_prompt: str) -> list[dict[str, Any]]:
     """Build the OpenAI-format message list: our system prompt first, then turns.
@@ -84,6 +95,8 @@ async def run(
     # does the same when the AGENT sets an effort).
     effort = reasoning_effort_override or choice.reasoning_effort
     reasoning_max_tokens = None if effort else choice.reasoning_max_tokens
+    tool_rounds, tool_seconds = profiles.tool_budget_for(profile)
+    started = time.monotonic()
     convo = _prepare(messages, extra_system, system_prompt)
     if not any(m["role"] == "user" for m in convo):
         yield {"type": "error", "message": "no user message provided"}
@@ -98,10 +111,19 @@ async def run(
             totals[key] = totals.get(key, 0) + int(value or 0)
 
     try:
-        for _turn in range(config.MAX_TOOL_TURNS):
+        # One model call more than there are tool rounds. When the rounds or the
+        # seconds run out, that call goes out with tools disallowed, so the
+        # student gets an answer built from everything already looked up. Before
+        # this, the run stopped after its last tool round and threw all of that
+        # away (a student waited 153 s on 2026-10-06 for an apology).
+        for turn in range(tool_rounds + 1):
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
             finish_reason: str | None = None
+            must_answer = turn == tool_rounds or (
+                tool_seconds > 0 and turn > 0 and time.monotonic() - started > tool_seconds)
+            if must_answer:
+                convo.append({"role": "system", "content": _ANSWER_NOW})
 
             async for ev in llm.astream_chain(
                 models=choice.chain,
@@ -111,6 +133,7 @@ async def run(
                 temperature=config.TEMPERATURE,
                 reasoning_effort=effort,
                 reasoning_max_tokens=reasoning_max_tokens,
+                tool_choice="none" if must_answer else "auto",
             ):
                 if ev["type"] == "text":
                     text_parts.append(ev["text"])
@@ -121,6 +144,12 @@ async def run(
                     add_usage(ev.get("usage"))
                     if ev.get("model"):
                         active_model = ev["model"]
+
+            if must_answer:
+                # A provider that ignored tool_choice still gets no more tools.
+                tool_calls = []
+                if not text_parts and finish_reason != "length":
+                    yield {"type": "text", "text": _GAVE_UP}
 
             if not tool_calls:
                 # A reasoning model can burn its whole token budget thinking and
@@ -134,7 +163,7 @@ async def run(
                 if totals:
                     yield {"type": "usage", "usage": totals}
                 yield {"type": "done", "finish_reason": finish_reason,
-                       "model": active_model}
+                       "model": active_model, "tool_budget_spent": must_answer}
                 return
 
             # Record the assistant's tool-call turn (OpenAI message shape).
@@ -208,10 +237,6 @@ async def run(
                     "content": json.dumps(out if out is not None else {"error": "tool did not complete"}),
                 })
 
-        yield {"type": "text", "text": "\n\n_(That took more lookups than I can do in one reply. Ask again with a narrower question and I'll finish the job.)_"}
-        if totals:
-            yield {"type": "usage", "usage": totals}
-        yield {"type": "done", "model": active_model}
     except Exception as exc:
         yield {"type": "error", "message": str(exc)}
 

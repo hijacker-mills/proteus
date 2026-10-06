@@ -115,6 +115,7 @@ async def astream(
     temperature: float,
     reasoning_effort: str | None = None,
     reasoning_max_tokens: int | None = None,
+    tool_choice: str = "auto",
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Stream one model completion. Yields normalized events:
@@ -128,7 +129,15 @@ async def astream(
     reports them. Without it the gateway cannot say what a user or an agent
     cost, which for a shared provider account is the first question asked when
     the bill arrives.
+
+    `tool_choice="none"` asks for an answer with no tool call. The tools are
+    still sent where the provider takes the flag, because they sit in the
+    cached prompt prefix and dropping them would miss the cache on the one call
+    that most needs to be quick. Providers routed outside LiteLLM get no tools.
     """
+    if tool_choice == "none" and model.startswith(("codex/", "openai-codex/", "mock/")):
+        tools = None
+
     # Codex (ChatGPT OAuth) is not a LiteLLM provider — route it to our own
     # Responses-API client. Same normalized event contract, so callers don't care.
     if model.startswith("codex/") or model.startswith("openai-codex/"):
@@ -226,7 +235,7 @@ async def astream(
     }
     if tools:
         kwargs["tools"] = tools
-        kwargs["tool_choice"] = "auto"
+        kwargs["tool_choice"] = tool_choice
 
     response = await litellm.acompletion(**kwargs)
 
@@ -294,6 +303,7 @@ async def astream_chain(
     temperature: float,
     reasoning_effort: str | None = None,
     reasoning_max_tokens: int | None = None,
+    tool_choice: str = "auto",
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Stream `models[0]`, falling through to the next one if it fails.
 
@@ -330,6 +340,7 @@ async def astream_chain(
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 reasoning_max_tokens=reasoning_max_tokens,
+                tool_choice=tool_choice,
             ):
                 started = True
                 yield event

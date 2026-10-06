@@ -98,6 +98,21 @@ def model_for(name: str | None) -> ModelChoice:
     )
 
 
+def tool_budget_for(name: str | None) -> tuple[int, int]:
+    """(tool rounds, seconds) one reply may spend calling tools for a profile.
+
+    The seconds are 0 when there is no time limit. Never raises, for the same
+    reason as `model_for`.
+    """
+    try:
+        agent = _pick(name)
+    except Exception:                            # pragma: no cover - defensive
+        agent = None
+    rounds = (agent.tool_rounds if agent else None) or config.MAX_TOOL_TURNS
+    seconds = (agent.tool_time_budget if agent else None) or config.TOOL_TIME_BUDGET
+    return max(1, rounds), max(0, seconds)
+
+
 def resolve(name: str | None, host_tools: bool = False):
     """Return (system_prompt_text, tools, dispatch) for a profile name."""
     agent = _pick(name)
