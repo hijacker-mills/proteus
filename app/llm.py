@@ -14,12 +14,15 @@ only on `astream()` and its normalized event shape.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, AsyncGenerator
 
 import litellm
 
 from . import config
+
+logger = logging.getLogger("proteus.llm")
 
 # Keep the gateway quiet and resilient across heterogeneous providers.
 litellm.telemetry = False
@@ -111,6 +114,7 @@ async def astream(
     max_tokens: int,
     temperature: float,
     reasoning_effort: str | None = None,
+    reasoning_max_tokens: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Stream one model completion. Yields normalized events:
@@ -164,6 +168,43 @@ async def astream(
 
     if config.PROMPT_CACHING and model.startswith(_EXPLICIT_CACHE_PREFIXES):
         messages, tools = _apply_cache_breakpoint(messages, tools)
+
+    # OpenRouter fronts several providers per model and picks one per request,
+    # and they are NOT interchangeable on speed. Measured on
+    # z-ai/glm-5.3-flash, same prompt, same params: 0.6-0.8s when Baseten
+    # served it and 15-17s when a slower provider did, with the unpinned
+    # default sitting around 10s. That spread is the single biggest lever on
+    # how Qubi feels, so it is worth naming the provider you want.
+    #
+    # `allow_fallbacks` defaults ON deliberately. Pinning hard with fallbacks
+    # off returns a bare 429 the moment the preferred provider's shared pool is
+    # rate-limited, which it demonstrably is:
+    #   "z-ai/glm-5.3-flash is temporarily rate-limited upstream"
+    # A slow answer beats no answer. To get the fast path consistently, attach
+    # your own provider key in OpenRouter's integrations settings; that leaves
+    # the shared pool and its limits behind.
+    if model.startswith("openrouter/"):
+        routing: dict[str, Any] = {}
+        if config.OPENROUTER_PROVIDER_ORDER:
+            routing["order"] = config.OPENROUTER_PROVIDER_ORDER
+        if config.OPENROUTER_PROVIDER_SORT:
+            routing["sort"] = config.OPENROUTER_PROVIDER_SORT
+        extra_body: dict[str, Any] = {}
+        if routing:
+            routing["allow_fallbacks"] = config.OPENROUTER_ALLOW_FALLBACKS
+            extra_body["provider"] = routing
+        # Bound or steer reasoning. OpenRouter accepts only ONE of
+        # reasoning.effort / reasoning.max_tokens — sending both is HTTP 400.
+        # effort wins when the agent asks for both.
+        if reasoning_effort:
+            extra_body["reasoning"] = {"effort": reasoning_effort}
+        elif reasoning_max_tokens:
+            extra_body["reasoning"] = {"max_tokens": reasoning_max_tokens}
+        if extra_body:
+            extra_kwargs = {**extra_kwargs, "extra_body": extra_body}
+    elif reasoning_effort:
+        # Non-OpenRouter providers that understand the unified effort param.
+        extra_kwargs = {**extra_kwargs, "reasoning_effort": reasoning_effort}
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -242,7 +283,65 @@ async def astream(
         })
 
     yield {"type": "final", "tool_calls": tool_calls,
-           "finish_reason": finish_reason, "usage": usage}
+           "finish_reason": finish_reason, "usage": usage, "model": model}
+
+
+async def astream_chain(
+    models: list[str],
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    max_tokens: int,
+    temperature: float,
+    reasoning_effort: str | None = None,
+    reasoning_max_tokens: int | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Stream `models[0]`, falling through to the next one if it fails.
+
+    Same normalized event contract as `astream`; this only decides WHICH model
+    produces them.
+
+    THE RULE: a model is abandoned only if it fails before yielding anything.
+    Once one event is out, the caller has it — the HTTP layer has already
+    flushed those tokens to the student's screen — and re-running the turn on
+    another model would either duplicate the text or contradict it mid-sentence.
+    So a mid-stream failure propagates, exactly as it did before fallbacks
+    existed. Fallbacks buy availability at connect time, not a redo.
+
+    Deliberately not LiteLLM's own `fallbacks=` kwarg: that routes through
+    `completion_with_fallbacks`, whose behaviour around streaming and our
+    normalized events varies by version. Being explicit here makes the rule
+    above readable and testable, and keeps `astream` a single-model primitive.
+
+    `astream` is looked up as a module global on each attempt, so tests that
+    monkeypatch `llm.astream` still intercept every call.
+    """
+    chain = [m for m in models if m]
+    if not chain:
+        chain = [config.MODEL]
+
+    for index, model in enumerate(chain):
+        started = False
+        try:
+            async for event in astream(
+                model=model,
+                messages=messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                reasoning_max_tokens=reasoning_max_tokens,
+            ):
+                started = True
+                yield event
+            return
+        except Exception as exc:
+            remaining = chain[index + 1:]
+            if started or not remaining:
+                raise
+            logger.warning(
+                "model %s failed before producing output (%s: %s) — falling back to %s",
+                model, type(exc).__name__, str(exc)[:200], remaining[0],
+            )
 
 
 async def close() -> None:

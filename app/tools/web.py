@@ -2,8 +2,8 @@
 Web tools: search + fetch. Give the agent live information and the ability to
 read pages — the "do you have a browser?" capability.
 
-- web_search: Tavily (if TAVILY_API_KEY set, best quality) else DuckDuckGo HTML
-  (no key required).
+- web_search: Tavily (if TAVILY_API_KEY set, best quality), else Google News RSS
+  for recency queries (no key required), else Wikipedia, else a real browser.
 - web_fetch: r.jina.ai reader for clean markdown (no key) with a raw-strip fallback.
 """
 from __future__ import annotations
@@ -151,6 +151,49 @@ async def _serper(query: str, count: int) -> dict | None:
                         for x in (d.get("organic") or [])[:count]]}
 
 
+async def _google_news_rss(query: str, count: int) -> dict | None:
+    """Keyless news search via Google News RSS, for recency queries only.
+
+    Returns None for non-recency queries (and on empty/error) so the normal
+    chain is untouched: definitional questions still get Wikipedia, and any
+    failure here falls through to the browser path below. No key, plain HTTP,
+    stdlib XML parsing — no new dependencies.
+    """
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote_plus
+
+    if not _RECENCY_RE.search(query):
+        return None
+
+    r = await get_client().get(
+        "https://news.google.com/rss/search",
+        params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+        headers={"User-Agent": _UA, "Accept": "application/rss+xml"},
+        timeout=15, follow_redirects=True,
+    )
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    results = []
+    for item in root.findall(".//item")[:count]:
+        raw_title = (item.findtext("title") or "").strip()
+        if not raw_title:
+            continue
+        # Titles arrive as "Headline - Publisher".
+        title, _, publisher = raw_title.rpartition(" - ")
+        if not title:
+            title, publisher = raw_title, ""
+        source_el = item.find("source")
+        publisher = (source_el.text.strip() if source_el is not None and source_el.text else publisher).strip()
+        url = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        snippet = " — ".join(x for x in (publisher, pub_date) if x)[:300]
+        results.append({"title": title[:140], "url": url, "snippet": snippet})
+
+    if not results:
+        return None
+    return {"provider": "googlenews-rss", "query": query, "results": results}
+
+
 # Search-result extraction, done in the page. Engine-specific selectors first,
 # then a generic heuristic, because every engine wraps its result links in a
 # click-tracking redirect and the visible URL lives in a separate element.
@@ -229,11 +272,13 @@ async def _via_browser(query: str, count: int) -> dict:
 
 
 async def web_search(query: str, count: int = 5) -> dict:
-    """A keyed provider if one is configured, then Wikipedia, then a real browser.
+    """A keyed provider if one is configured, then news RSS, Wikipedia, browser.
 
     Wikipedia sits ahead of the browser rather than behind it because the
     browser path is only as good as the one engine that will still answer this
-    host, and that engine is not good. See `_wikipedia`.
+    host, and that engine is not good. See `_wikipedia`. Google News RSS sits
+    ahead of Wikipedia: it only fires on recency queries (the ones Wikipedia
+    deliberately skips), so definitional questions are untouched.
     """
     query = (query or "").strip()
     if not query:
@@ -243,6 +288,7 @@ async def web_search(query: str, count: int = 5) -> dict:
     for key, provider in ((config.TAVILY_API_KEY, _tavily),
                           (config.BRAVE_SEARCH_API_KEY, _brave),
                           (config.SERPER_API_KEY, _serper),
+                          (True, _google_news_rss),
                           (True, _wikipedia)):
         if not key:
             continue

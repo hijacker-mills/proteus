@@ -66,17 +66,32 @@ async def run(
     extra_system: str = "",
     profile: str | None = None,
     host_tools: bool = False,
+    reasoning_effort_override: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """`host_tools` grants the caller shell/run_code/email/schedule. It defaults
     to False and must be an explicit decision by the entry point (see
-    toolsets.HOST_TOOLS) — the profile alone never unlocks host access."""
+    toolsets.HOST_TOOLS) — the profile alone never unlocks host access.
+    `reasoning_effort_override` lets a caller that already knows a turn is
+    trivial (a greeting, a thank-you) ask for less thinking than the agent's
+    configured effort. It never raises the effort above the agent's own."""
     system_prompt, tools, dispatch = profiles.resolve(profile, host_tools=host_tools)
+    # Which model runs this profile. An agent file may name its own, and its own
+    # fallbacks; both default to the gateway's MODEL / MAX_TOKENS.
+    choice = profiles.model_for(profile)
+    # A validated per-request override wins over the agent default. Effort and
+    # max_tokens are mutually exclusive on OpenRouter, so an overridden effort
+    # also drops the agent's reasoning_max_tokens (profiles.model_for already
+    # does the same when the AGENT sets an effort).
+    effort = reasoning_effort_override or choice.reasoning_effort
+    reasoning_max_tokens = None if effort else choice.reasoning_max_tokens
     convo = _prepare(messages, extra_system, system_prompt)
     if not any(m["role"] == "user" for m in convo):
         yield {"type": "error", "message": "no user message provided"}
         return
 
     totals: dict[str, int] = {}
+    # Last model that actually produced output for this run (tracks fallbacks).
+    active_model = choice.model
 
     def add_usage(u: dict[str, int] | None) -> None:
         for key, value in (u or {}).items():
@@ -86,25 +101,40 @@ async def run(
         for _turn in range(config.MAX_TOOL_TURNS):
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
+            finish_reason: str | None = None
 
-            async for ev in llm.astream(
-                model=config.MODEL,
+            async for ev in llm.astream_chain(
+                models=choice.chain,
                 messages=convo,
                 tools=tools,
-                max_tokens=config.MAX_TOKENS,
+                max_tokens=choice.max_tokens,
                 temperature=config.TEMPERATURE,
+                reasoning_effort=effort,
+                reasoning_max_tokens=reasoning_max_tokens,
             ):
                 if ev["type"] == "text":
                     text_parts.append(ev["text"])
                     yield {"type": "text", "text": ev["text"]}
                 elif ev["type"] == "final":
                     tool_calls = ev["tool_calls"]
+                    finish_reason = ev.get("finish_reason")
                     add_usage(ev.get("usage"))
+                    if ev.get("model"):
+                        active_model = ev["model"]
 
             if not tool_calls:
+                # A reasoning model can burn its whole token budget thinking and
+                # stop (finish_reason=length) before emitting a word. Left
+                # unflagged that reads downstream as a normal empty reply; make
+                # it an explicit error so the client shows something.
+                if finish_reason == "length" and not text_parts:
+                    yield {"type": "error",
+                           "message": "reply truncated: the model used its whole "
+                                      "token budget reasoning before answering"}
                 if totals:
                     yield {"type": "usage", "usage": totals}
-                yield {"type": "done"}
+                yield {"type": "done", "finish_reason": finish_reason,
+                       "model": active_model}
                 return
 
             # Record the assistant's tool-call turn (OpenAI message shape).
@@ -140,6 +170,18 @@ async def run(
 
             tasks = [asyncio.create_task(_invoke(i, c)) for i, c in enumerate(tool_calls)]
             outputs: list[Any] = [None] * len(tool_calls)
+
+            # The start of each call is its own event, ahead of the completion
+            # events that land as each tool finishes. Streaming clients use it
+            # to say what Qubi is doing *while* it happens; JSON consumers
+            # (_collect) ignore the type, so non-streaming replies still carry
+            # completions only.
+            for call in tool_calls:
+                yield {
+                    "type": "tool_start",
+                    "event": events.make_event(user_id, call["name"], "started", 0.0, call["arguments"]),
+                }
+
             try:
                 # Events are emitted as each tool lands, so the UI updates in
                 # completion order rather than waiting for the slowest.
@@ -166,10 +208,10 @@ async def run(
                     "content": json.dumps(out if out is not None else {"error": "tool did not complete"}),
                 })
 
-        yield {"type": "text", "text": "\n\n_(reached tool-call limit — try narrowing the question.)_"}
+        yield {"type": "text", "text": "\n\n_(That took more lookups than I can do in one reply. Ask again with a narrower question and I'll finish the job.)_"}
         if totals:
             yield {"type": "usage", "usage": totals}
-        yield {"type": "done"}
+        yield {"type": "done", "model": active_model}
     except Exception as exc:
         yield {"type": "error", "message": str(exc)}
 

@@ -9,6 +9,7 @@ right way round — the frontmatter carries the config, the body IS the prompt:
     description: Answers product questions and files tickets
     toolset: [web, custom]
     model: null          # null / omitted = inherit MODEL
+    fallbacks: []        # models to try, in order, if `model` fails
     max_tokens: 1500
     ---
 
@@ -55,7 +56,18 @@ class Agent:
     toolset: str = "none"
     description: str = ""
     model: str | None = None
+    # Tried in order when `model` fails BEFORE producing any output. A model that
+    # has already started streaming is never retried on another model — see
+    # `llm.astream_chain`, which explains why.
+    fallbacks: list[str] = field(default_factory=list)
     max_tokens: int | None = None
+    # Hard cap on reasoning tokens for a forced-reasoning model, so thinking
+    # cannot eat the whole `max_tokens` budget before any answer is emitted.
+    # None means fall back to the gateway's REASONING_MAX_TOKENS.
+    reasoning_max_tokens: int | None = None
+    # OpenRouter/OpenAI reasoning effort (low|medium|high). When set it is sent
+    # instead of reasoning_max_tokens — OpenRouter accepts only one of the two.
+    reasoning_effort: str | None = None
     # Named behaviour blocks appended to the system prompt when a request asks
     # for one by name (X-Proteus-Mode). The gateway supplies the MECHANISM; the
     # agent supplies the CONTENT, so no domain vocabulary lives in the core.
@@ -99,16 +111,34 @@ def _toolset_str(value: Any) -> str:
     return str(value).strip()
 
 
+def _str_list(value: Any) -> list[str]:
+    """Accept `fallbacks: [a, b]` or `fallbacks: a,b`, and drop empties."""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    return [s for s in (str(v).strip() for v in items) if s]
+
+
 def agent_from_markdown(text: str, name: str, source: str) -> Agent:
     meta, body = parse_markdown(text, name_hint=name)
-    known = {"name", "description", "toolset", "model", "max_tokens", "modes"}
+    known = {"name", "description", "toolset", "model", "fallbacks", "max_tokens",
+             "reasoning_max_tokens", "reasoning_effort", "modes"}
+    effort = str(meta.get("reasoning_effort") or "").strip().lower() or None
+    if effort and effort not in {"minimal", "low", "medium", "high"}:
+        logger.warning("agent %s: invalid reasoning_effort %r — ignoring",
+                       name or "?", effort)
+        effort = None
     return Agent(
         name=str(meta.get("name") or name).strip(),
         prompt=body.strip(),
         toolset=_toolset_str(meta.get("toolset")),
         description=str(meta.get("description") or "").strip(),
         model=(str(meta["model"]).strip() or None) if meta.get("model") else None,
+        fallbacks=_str_list(meta.get("fallbacks")),
         max_tokens=int(meta["max_tokens"]) if meta.get("max_tokens") else None,
+        reasoning_max_tokens=(int(meta["reasoning_max_tokens"])
+                              if meta.get("reasoning_max_tokens") else None),
+        reasoning_effort=effort,
         modes={str(k).strip().lower(): str(v).strip()
                for k, v in (meta.get("modes") or {}).items() if str(v).strip()},
         source=source,
