@@ -53,6 +53,25 @@ def _render_payload(tool: str, result: Any) -> dict[str, Any] | None:
                 }
             cards.append(card)
         return {"images": cards} if cards else None
+    if tool == "youtube_fetch":
+        # `youtube_search` is not here on purpose: it returns candidates the
+        # model still has to choose between, and shipping all of them would put
+        # a shelf of unvetted videos on screen. Fetch is the commitment — the
+        # agent is told to call it on the one it intends to recommend — so a
+        # fetch event names exactly one video and is safe to draw.
+        #
+        # Chapters stay behind: the client shows one card, and which chapter to
+        # open at is the model's judgement, carried in its own reply.
+        vid = result.get("id")
+        url = result.get("url")
+        if not vid or not url:
+            return None
+        video = {"id": str(vid), "url": str(url)}
+        for key, limit in (("title", 200), ("channel", 120), ("views", 40), ("thumbnail", 500)):
+            value = result.get(key)
+            if value:
+                video[key] = str(value)[:limit]
+        return {"video": video}
     return None
 
 
@@ -91,9 +110,9 @@ def make_event(
                     ev["hits"] = len(result[key])
                     break
 
-    # Structured render payload for tools with a frontend card (image_search).
-    # Rides along on the same `proteus_tool_event` chunk; telemetry fields above
-    # are unchanged, so existing consumers keep working.
+    # Structured render payload for tools with a frontend card (image_search,
+    # youtube_fetch). Rides along on the same `proteus_tool_event` chunk;
+    # telemetry fields above are unchanged, so existing consumers keep working.
     if status == "ok":
         data = _render_payload(tool, result)
         if data is not None:
