@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote
 
 from .. import config
 from ..httpclient import get_client
+from . import egress
 from .url_safety import is_safe_url_async, refusal
 
 logger = logging.getLogger("proteus.tools.web")
@@ -323,7 +324,9 @@ async def web_fetch(url: str, max_chars: int | None = None) -> dict:
         pass
 
     try:
-        r = await get_client().get(url, headers={"User-Agent": _UA}, timeout=25, follow_redirects=True)
+        # Through the egress proxy, so each redirect hop is checked too.
+        client = await egress.get_client()
+        r = await client.get(url, headers={"User-Agent": _UA}, timeout=25, follow_redirects=True)
         r.raise_for_status()
         return {"url": url, "content": _strip_html(r.text)[:limit]}
     except Exception as exc:

@@ -15,9 +15,10 @@ It returns a SNAPSHOT (title, text, links, inputs, buttons) rather than a
 screenshot, because a model reads structured text far better than pixels, and
 because headless Chrome here has no GPU.
 
-SECURITY. Every URL goes through the SSRF guard in `url_safety` first, so a
-model cannot steer this at cloud metadata or your internal network. That guard
-fails closed.
+SECURITY. Chromium sends all of its traffic through the egress proxy
+(`egress.py`), which checks the address of every connection: the page, each
+redirect hop, and everything the page loads. The `url_safety` check up front
+only gives the model a clear refusal before a page is opened.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ import logging
 from typing import Any
 
 from .. import config
+from . import egress
 from .url_safety import is_safe_url_async, refusal
 
 logger = logging.getLogger("proteus.tools.browser")
@@ -57,9 +59,16 @@ async def _get_context():
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(
             headless=True,
+            # Chromium bypasses a proxy for loopback unless told not to, which
+            # would leave http://127.0.0.1 open.
+            proxy={"server": await egress.proxy_url(), "bypass": "<-loopback>"},
             # --no-sandbox is required in most containers; --disable-dev-shm-usage
             # avoids Chrome dying on the small /dev/shm a container usually gets.
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            # WebRTC sends UDP straight past an HTTP proxy, so it is kept to
+            # proxied traffic only.
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                  "--webrtc-ip-handling-policy=disable_non_proxied_udp"],
         )
         _context = await _browser.new_context(user_agent=_UA, locale="en-US")
         logger.info("headless chromium launched")

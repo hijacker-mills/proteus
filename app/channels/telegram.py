@@ -11,10 +11,12 @@ Enabled when TELEGRAM_BOT_TOKEN is set.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 
 from .. import config
 from ..httpclient import get_client
@@ -167,10 +169,29 @@ async def _process(msg: dict) -> None:
     )
 
 
+def _webhook_secret() -> str:
+    """The token Telegram echoes back in X-Telegram-Bot-Api-Secret-Token.
+
+    TELEGRAM_WEBHOOK_SECRET if set, otherwise derived from the bot token, so a
+    webhook deployment is protected without any extra configuration. Telegram
+    allows only [A-Za-z0-9_-] here, which hex satisfies.
+    """
+    if config.TELEGRAM_WEBHOOK_SECRET:
+        return config.TELEGRAM_WEBHOOK_SECRET
+    return hmac.new(config.TELEGRAM_BOT_TOKEN.encode(), b"proteus-telegram-webhook",
+                    hashlib.sha256).hexdigest()
+
+
 @router.post("/channels/telegram/webhook")
 async def telegram_webhook(request: Request):
-    if not enabled():
-        return {"ok": False, "error": "telegram not configured"}
+    # Anyone who can reach this URL could otherwise post a forged update as an
+    # allowlisted user, and allowlisted users get host tools. In polling mode
+    # nothing legitimate ever calls it.
+    if not enabled() or config.TELEGRAM_MODE != "webhook":
+        return Response(status_code=404)
+    presented = request.headers.get("x-telegram-bot-api-secret-token") or ""
+    if not hmac.compare_digest(presented.encode(), _webhook_secret().encode()):
+        return Response(status_code=403)
     update = await request.json()
     msg = update.get("message") or update.get("edited_message")
     if msg:
@@ -211,5 +232,6 @@ async def poll() -> None:
 async def setup_webhook() -> None:
     if config.PUBLIC_BASE_URL:
         url = f"{config.PUBLIC_BASE_URL}/channels/telegram/webhook"
-        await get_client().post(_api("setWebhook"), json={"url": url, "allowed_updates": ["message"]})
+        await get_client().post(_api("setWebhook"), json={
+            "url": url, "allowed_updates": ["message"], "secret_token": _webhook_secret()})
         logger.info("telegram webhook set to %s", url)

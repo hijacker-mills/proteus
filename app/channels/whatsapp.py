@@ -58,8 +58,9 @@ async def _send(to: str, text: str) -> None:
 
 
 def _verify_signature(body: bytes, signature: str | None) -> bool:
+    # No secret means no way to tell Meta from anyone else, so refuse.
     if not config.WHATSAPP_APP_SECRET:
-        return True  # verification disabled if no secret configured
+        return False
     if not signature or not signature.startswith("sha256="):
         return False
     digest = hmac.new(config.WHATSAPP_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
@@ -70,8 +71,10 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
 async def whatsapp_verify(request: Request):
     params = request.query_params
     if (
-        params.get("hub.mode") == "subscribe"
-        and params.get("hub.verify_token") == config.WHATSAPP_VERIFY_TOKEN
+        config.WHATSAPP_VERIFY_TOKEN
+        and params.get("hub.mode") == "subscribe"
+        and hmac.compare_digest(params.get("hub.verify_token", "").encode(),
+                                config.WHATSAPP_VERIFY_TOKEN.encode())
     ):
         return Response(content=params.get("hub.challenge", ""), media_type="text/plain")
     return Response(content="forbidden", status_code=403)
