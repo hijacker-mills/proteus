@@ -508,3 +508,147 @@ def test_metrics_escapes_label_values():
 
     metrics.inc("proteus_test_total", 1, tenant='say "hi"')
     assert '\\"hi\\"' in metrics.render()
+
+
+# ── egress proxy ─────────────────────────────────────────────────────────────
+
+async def _local_site(routes: dict[str, tuple[int, dict[str, str], bytes]]):
+    """A tiny HTTP server on 127.0.0.1. Returns (server, base_url)."""
+    async def handle(reader, writer):
+        head = await reader.readuntil(b"\r\n\r\n")
+        path = head.split(b" ", 2)[1].decode()
+        status, headers, body = routes.get(path, (404, {}, b"missing"))
+        lines = [f"HTTP/1.1 {status} X", f"Content-Length: {len(body)}", "Connection: close",
+                 *(f"{k}: {v}" for k, v in headers.items())]
+        writer.write(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+
+
+def test_egress_proxy_refuses_loopback(monkeypatch):
+    from app import config
+    from app.tools import egress
+
+    monkeypatch.setattr(config, "ALLOW_PRIVATE_URLS", False)
+
+    async def run():
+        server, base = await _local_site({"/": (200, {}, b"internal")})
+        try:
+            client = await egress.get_client()
+            r = await client.get(base + "/")
+            return r.status_code, r.text
+        finally:
+            server.close()
+            await egress.close()
+
+    status, text = asyncio.run(run())
+    assert status == 403 and "internal" not in text
+
+
+def test_egress_proxy_checks_every_redirect_hop(monkeypatch):
+    """A page that is allowed must not be able to redirect to one that isn't."""
+    from app import config
+    from app.tools import egress
+
+    # Private space allowed so the local test site is reachable; the metadata
+    # tier stays blocked whatever this says.
+    monkeypatch.setattr(config, "ALLOW_PRIVATE_URLS", True)
+
+    async def run():
+        server, base = await _local_site({
+            "/ok": (200, {}, b"public page"),
+            "/hop": (302, {"Location": "http://169.254.169.254/latest/meta-data/"}, b""),
+        })
+        try:
+            client = await egress.get_client()
+            ok = await client.get(base + "/ok")
+            hop = await client.get(base + "/hop", follow_redirects=True)
+            return ok.text, hop.status_code, str(hop.url)
+        finally:
+            server.close()
+            await egress.close()
+
+    ok_text, hop_status, hop_url = asyncio.run(run())
+    assert ok_text == "public page"
+    assert hop_status == 403 and "169.254.169.254" in hop_url
+
+
+def test_vetted_addresses_returns_the_checked_ip():
+    from app.tools import url_safety
+
+    assert url_safety.vetted_addresses("1.1.1.1") == ["1.1.1.1"]
+    assert url_safety.vetted_addresses("127.0.0.1") is None
+    assert url_safety.vetted_addresses("") is None
+
+
+# ── channel webhooks ─────────────────────────────────────────────────────────
+
+def _webhook_client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app import channels
+
+    app = FastAPI()
+    for router in channels.routers():
+        app.include_router(router)
+    return TestClient(app)
+
+
+def test_telegram_webhook_is_closed_in_polling_mode(monkeypatch):
+    from app import config
+
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.setattr(config, "TELEGRAM_MODE", "polling")
+    r = _webhook_client().post("/channels/telegram/webhook", json={"message": {"text": "hi"}})
+    assert r.status_code == 404
+
+
+def test_telegram_webhook_requires_the_secret_token(monkeypatch):
+    from app import config
+    from app.channels import telegram
+
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.setattr(config, "TELEGRAM_MODE", "webhook")
+    monkeypatch.setattr(config, "TELEGRAM_WEBHOOK_SECRET", "")
+    client = _webhook_client()
+
+    assert client.post("/channels/telegram/webhook", json={}).status_code == 403
+    r = client.post("/channels/telegram/webhook", json={},
+                    headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"})
+    assert r.status_code == 403
+    r = client.post("/channels/telegram/webhook", json={},
+                    headers={"X-Telegram-Bot-Api-Secret-Token": telegram._webhook_secret()})
+    assert r.status_code == 200
+
+
+def test_whatsapp_refuses_inbound_without_an_app_secret(monkeypatch):
+    from app import config
+
+    monkeypatch.setattr(config, "WHATSAPP_APP_SECRET", "")
+    monkeypatch.setattr(config, "WHATSAPP_VERIFY_TOKEN", "")
+    client = _webhook_client()
+    assert client.post("/channels/whatsapp/webhook", json={"object": "x"}).status_code == 403
+    r = client.get("/channels/whatsapp/webhook",
+                   params={"hub.mode": "subscribe", "hub.verify_token": "", "hub.challenge": "c"})
+    assert r.status_code == 403
+
+
+# ── identity window ──────────────────────────────────────────────────────────
+
+def test_identity_proof_older_than_two_minutes_is_refused(monkeypatch):
+    import hashlib
+    import hmac
+    import time
+
+    from app import config, main
+
+    secret = "s" * 32
+    monkeypatch.setattr(config, "PROTEUS_IDENTITY_SECRET", secret)
+    timestamp = str(int(time.time()) - 150)
+    signature = hmac.new(secret.encode(), f"user-123:{timestamp}".encode(), hashlib.sha256).hexdigest()
+    with pytest.raises(Exception, match="expired user identity proof"):
+        main._verify_identity("user-123", timestamp, signature)

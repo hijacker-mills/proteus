@@ -81,44 +81,67 @@ def _is_always_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
     return ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS)
 
 
-def is_safe_url(url: str) -> bool:
-    """True if this URL may be fetched. Blocking is the default on any doubt."""
-    try:
-        parsed = urlparse(url)
-        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
-        scheme = (parsed.scheme or "").strip().lower()
+def vetted_addresses(hostname: str) -> list[str] | None:
+    """Resolve `hostname` and return its addresses, or None if any is blocked.
 
-        if scheme not in ("http", "https"):
-            logger.warning("blocked: unsupported scheme %r", scheme or "<empty>")
-            return False
+    Every address has to pass, not just the first: a resolver can return a public
+    and an internal address together, and the client picks which one it dials.
+    The egress proxy (`egress.py`) connects to one of the addresses returned
+    here rather than resolving again, so a DNS answer that changes between the
+    check and the connection cannot slip an internal address through.
+    """
+    try:
+        hostname = (hostname or "").strip().lower().rstrip(".")
         if not hostname:
-            return False
+            return None
         if hostname in _BLOCKED_HOSTNAMES:
             logger.warning("blocked: internal hostname %s", hostname)
-            return False
+            return None
 
         try:
             addrs = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except socket.gaierror:
             logger.warning("blocked: DNS resolution failed for %s", hostname)
-            return False
+            return None
 
+        vetted: list[str] = []
         for _family, _type, _proto, _canon, sockaddr in addrs:
             raw = sockaddr[0].split("%")[0]          # strip any IPv6 scope id
             try:
                 ip = ipaddress.ip_address(raw)
             except ValueError:
                 logger.warning("blocked: unparseable address %r for %s", sockaddr[0], hostname)
-                return False
+                return None
 
             if _is_always_blocked_ip(ip):
                 logger.warning("blocked: cloud metadata address %s -> %s", hostname, raw)
-                return False
+                return None
             if not config.ALLOW_PRIVATE_URLS and _is_blocked_ip(ip):
                 logger.warning("blocked: private/internal address %s -> %s", hostname, raw)
-                return False
-        return True
+                return None
+            if raw not in vetted:
+                vetted.append(raw)
+        return vetted or None
 
+    except Exception as exc:
+        logger.warning("blocked: address check errored for %s: %s", hostname, exc)
+        return None
+
+
+def is_safe_url(url: str) -> bool:
+    """True if this URL may be fetched. Blocking is the default on any doubt.
+
+    This is a pre-check, so a tool can refuse with a clear message before doing
+    any work. It cannot see redirects or DNS changes after it runs; the fetch
+    itself has to go through the egress proxy for that.
+    """
+    try:
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").strip().lower()
+        if scheme not in ("http", "https"):
+            logger.warning("blocked: unsupported scheme %r", scheme or "<empty>")
+            return False
+        return vetted_addresses(parsed.hostname or "") is not None
     except Exception as exc:
         logger.warning("blocked: url safety check errored for %s: %s", url, exc)
         return False

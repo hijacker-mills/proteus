@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import (agent, channels, config, cron, db, httpclient, memory, metrics,
                profiles, ratelimit, redisc)
+from .tools import egress
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("proteus.http")
@@ -129,6 +130,7 @@ async def lifespan(_app: FastAPI):
         await channels.stop_pollers()
     await db.close_pool()
     await httpclient.close_client()
+    await egress.close()
     await redisc.close_redis()
     await agent.close()
 
@@ -184,6 +186,12 @@ def _resolve_user_id(body: dict[str, Any], header_uid: str | None) -> str | None
     return None
 
 
+# How old a signed identity may be. The web app signs immediately before it
+# calls, on the same host, so anything older is a replay.
+_IDENTITY_MAX_AGE = 120
+_IDENTITY_MAX_SKEW = 30
+
+
 def _verify_identity(user_id: str, timestamp: str | None, signature: str | None) -> None:
     """Verify the authenticated backend's short-lived user identity proof."""
     secret = config.PROTEUS_IDENTITY_SECRET
@@ -196,9 +204,9 @@ def _verify_identity(user_id: str, timestamp: str | None, signature: str | None)
     except ValueError:
         raise HTTPException(status_code=401, detail="invalid user identity proof")
     now = int(time.time())
-    if issued_at - now > 60:
+    if issued_at - now > _IDENTITY_MAX_SKEW:
         raise HTTPException(status_code=401, detail="future-dated user identity proof")
-    if now - issued_at > 300:
+    if now - issued_at > _IDENTITY_MAX_AGE:
         raise HTTPException(status_code=401, detail="expired user identity proof")
     message = f"{user_id}:{issued_at}".encode()
     expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()

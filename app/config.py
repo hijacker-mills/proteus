@@ -351,6 +351,8 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 # ── Telegram ─────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_MODE = os.environ.get("TELEGRAM_MODE", "polling").strip()  # polling | webhook
+# Webhook mode only. Unset means one derived from the bot token (channels/telegram.py).
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TELEGRAM_ALLOWED_USERS = [
     u.strip() for u in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()
 ]

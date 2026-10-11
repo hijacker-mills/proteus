@@ -238,14 +238,15 @@ async def run_job(job: dict) -> None:
         # URL they nominated. It goes through the SSRF guard at FIRE time, not
         # just at creation: DNS can be repointed at an internal address in the
         # interval between scheduling a job and it running.
-        from .httpclient import get_client
+        from .tools import egress
         from .tools.url_safety import is_safe_url_async
 
         if not await is_safe_url_async(job["target"]):
             logger.warning("cron job %s: refusing webhook to %s", job["id"], job["target"])
             return
         try:
-            await get_client().post(job["target"], json={
+            client = await egress.get_client()
+            await client.post(job["target"], json={
                 "job_id": job["id"], "user": job["user_key"],
                 "prompt": job["prompt"], "reply": reply})
             logger.info("cron job %s delivered to webhook (%d chars)", job["id"], len(reply))
