@@ -33,7 +33,7 @@ def scripted(script):
     state = {"i": 0}
     seen: list[list[dict]] = []
 
-    async def astream(model, messages, tools, max_tokens, temperature, reasoning_effort=None):
+    async def astream(model, messages, tools, max_tokens, temperature, reasoning_effort=None, **_):
         seen.append(list(messages))
         i = state["i"]; state["i"] += 1
         calls = script[i] if i < len(script) else []

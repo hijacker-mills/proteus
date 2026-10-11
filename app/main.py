@@ -230,6 +230,21 @@ def _resolve_mode(body: dict[str, Any], header_mode: str | None) -> str | None:
     return None
 
 
+_VALID_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _resolve_reasoning_effort(body: dict[str, Any]) -> str | None:
+    """Per-request reasoning effort override, or None for the agent default.
+
+    A caller that already classified a turn as trivial (a greeting) sends less
+    thinking than the agent's configured effort. Unknown values are ignored
+    rather than failing the turn."""
+    effort = body.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip().lower() in _VALID_EFFORTS:
+        return effort.strip().lower()
+    return None
+
+
 def _record(tenant: str, mode: str, total: float, ttft: float | None,
             usage: dict, tools: int) -> None:
     """One place that turns a finished turn into metrics."""
@@ -246,14 +261,16 @@ def _record(tenant: str, mode: str, total: float, ttft: float | None,
     metrics.gauge("proteus_rate_limited_total", ratelimit.limiter.rejected)
 
 
-def _chunk(chat_id: str, created: int, *, delta: dict | None = None,
-           finish: str | None = None, tool_event: dict | None = None,
-           usage: dict | None = None) -> str:
+def _chunk(chat_id: str, created: int, *, model: str | None = None,
+           delta: dict | None = None, finish: str | None = None,
+           tool_event: dict | None = None, usage: dict | None = None) -> str:
     payload: dict[str, Any] = {
         "id": chat_id,
         "object": "chat.completion.chunk",
         "created": created,
-        "model": config.MODEL,
+        # The model that answered THIS profile (agent frontmatter), not the
+        # gateway default. Qubi and assistant can differ; clients trust this field.
+        "model": model or config.MODEL,
         "choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}],
     }
     if tool_event is not None:
@@ -266,13 +283,19 @@ def _chunk(chat_id: str, created: int, *, delta: dict | None = None,
 
 
 async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
-               extra_system: str = "", host_tools: bool = False, tenant: str = "-") -> AsyncGenerator[str, None]:
+               extra_system: str = "", host_tools: bool = False, tenant: str = "-",
+               reasoning_effort: str | None = None) -> AsyncGenerator[str, None]:
     chat_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     t0 = time.time()
     ttft: float | None = None
     tools_used = 0
+    tool_names: list[str] = []
+    budget_spent = False
     usage: dict[str, int] = {}
+    finish_reason: str | None = None
+    # Profile's primary model until a fallback (or tool loop) reports otherwise.
+    response_model = profiles.model_for(profile).model
     # The slot is held for the WHOLE stream, not just the first byte: an
     # in-flight stream is still consuming upstream capacity. `finally` releases
     # it even when the client disconnects mid-stream, which cancels this
@@ -293,18 +316,19 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
         text = "".join(pending)
         pending = []
         last_flush = time.time()
-        return _chunk(chat_id, created, delta={"content": text})
+        return _chunk(chat_id, created, model=response_model, delta={"content": text})
 
     try:
-        yield _chunk(chat_id, created, delta={"role": "assistant"})
+        yield _chunk(chat_id, created, model=response_model, delta={"role": "assistant"})
         async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system,
-                                  profile=profile, host_tools=host_tools):
+                                  profile=profile, host_tools=host_tools,
+                                  reasoning_effort_override=reasoning_effort):
             if ev["type"] == "text":
                 first_token = ttft is None
                 if first_token:
                     ttft = time.time() - t0
                 if not coalesce:
-                    yield _chunk(chat_id, created, delta={"content": ev["text"]})
+                    yield _chunk(chat_id, created, model=response_model, delta={"content": ev["text"]})
                 else:
                     pending.append(ev["text"])
                     # The FIRST token always goes out immediately — TTFT is the
@@ -313,46 +337,59 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
                         out = _flush()
                         if out:
                             yield out
-            elif ev["type"] == "tool":
-                tools_used += 1
+            elif ev["type"] == "tool_start":
                 out = _flush()          # ordering: text before its tool event
                 if out:
                     yield out
-                yield _chunk(chat_id, created, tool_event=ev["event"])
+                yield _chunk(chat_id, created, model=response_model, tool_event=ev["event"])
+            elif ev["type"] == "tool":
+                tools_used += 1
+                tool_names.append(str(ev["event"].get("tool") or "?"))
+                out = _flush()          # ordering: text before its tool event
+                if out:
+                    yield out
+                yield _chunk(chat_id, created, model=response_model, tool_event=ev["event"])
             elif ev["type"] == "error":
                 out = _flush()          # don't drop buffered text on the way out
                 if out:
                     yield out
-                yield _chunk(chat_id, created, delta={"content": f"\n\n⚠️ {ev['message']}"}, finish="stop")
+                yield _chunk(chat_id, created, model=response_model,
+                             delta={"content": f"\n\n⚠️ {ev['message']}"}, finish="stop")
                 yield "data: [DONE]\n\n"
                 return
             elif ev["type"] == "usage":
                 usage = ev["usage"]
             elif ev["type"] == "done":
+                finish_reason = ev.get("finish_reason") or finish_reason
+                budget_spent = bool(ev.get("tool_budget_spent"))
+                if ev.get("model"):
+                    response_model = ev["model"]
                 break
         out = _flush()                  # ...nor at the end of a clean stream
         if out:
             yield out
         if usage:
-            yield _chunk(chat_id, created, usage=usage)
-        yield _chunk(chat_id, created, finish="stop")
+            yield _chunk(chat_id, created, model=response_model, usage=usage)
+        yield _chunk(chat_id, created, model=response_model, finish=finish_reason or "stop")
         metrics.inc("proteus_requests_total", tenant=tenant, mode="stream", outcome="ok")
         yield "data: [DONE]\n\n"
     finally:
         _limiter.release()
         _record(tenant, "stream", time.time() - t0, ttft, usage, tools_used)
-        logger.info("stream user=%s tenant=%s profile=%s ttft=%s total=%.0fms tools=%d "
-                    "tokens=%d/%d%s inflight=%d",
+        logger.info("stream user=%s tenant=%s profile=%s ttft=%s total=%.0fms tools=%d%s "
+                    "tokens=%d/%d%s inflight=%d%s",
                     user_id, tenant, profile or config.DEFAULT_PROFILE,
                     f"{ttft*1000:.0f}ms" if ttft else "none",
                     (time.time() - t0) * 1000, tools_used,
+                    f" [{','.join(tool_names)}]" if tool_names else "",
                     usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
                     f" cached={usage['cached_tokens']}" if usage.get("cached_tokens") else "",
-                    _limiter.in_use)
+                    _limiter.in_use, " tool_budget=spent" if budget_spent else "")
 
 
 async def _collect(user_id: str, body: dict[str, Any], profile: str | None = None,
-                   extra_system: str = "", host_tools: bool = False, tenant: str = "-") -> JSONResponse:
+                   extra_system: str = "", host_tools: bool = False, tenant: str = "-",
+                   reasoning_effort: str | None = None) -> JSONResponse:
     chat_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     t0 = time.time()
@@ -360,15 +397,22 @@ async def _collect(user_id: str, body: dict[str, Any], profile: str | None = Non
     tool_events: list[dict] = []
     usage: dict[str, int] = {}
     error: str | None = None
+    finish_reason: str | None = None
+    response_model = profiles.model_for(profile).model
     try:
         async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system,
-                                  profile=profile, host_tools=host_tools):
+                                  profile=profile, host_tools=host_tools,
+                                  reasoning_effort_override=reasoning_effort):
             if ev["type"] == "text":
                 text_parts.append(ev["text"])
             elif ev["type"] == "tool":
                 tool_events.append(ev["event"])
             elif ev["type"] == "usage":
                 usage = ev["usage"]
+            elif ev["type"] == "done":
+                finish_reason = ev.get("finish_reason") or finish_reason
+                if ev.get("model"):
+                    response_model = ev["model"]
             elif ev["type"] == "error":
                 error = ev["message"]
                 break
@@ -388,11 +432,11 @@ async def _collect(user_id: str, body: dict[str, Any], profile: str | None = Non
         "id": chat_id,
         "object": "chat.completion",
         "created": created,
-        "model": config.MODEL,
+        "model": response_model or config.MODEL,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
+            "finish_reason": ("stop" if error else (finish_reason or "stop")),
         }],
         "proteus_tool_events": tool_events,
         "usage": usage,
@@ -427,6 +471,9 @@ async def chat_completions(
     # looks it up. Absent or unknown → nothing injected.
     _agent = profiles.pick(profile)
     extra_system = _agent.mode_block(_resolve_mode(body, x_proteus_mode)) if _agent else ""
+    # Trivial-turn fast lane: a caller that classified this turn as small talk
+    # asks for less thinking than the agent's configured effort.
+    reasoning_effort = _resolve_reasoning_effort(body)
     # Host-access tools are off for HTTP callers unless an admin key is presented.
     host_tools = _host_tools_allowed(x_proteus_admin_key)
 
@@ -454,7 +501,7 @@ async def chat_completions(
 
     if body.get("stream"):
         return StreamingResponse(
-            _sse(user_id, body, profile, extra_system, host_tools, tenant),
+            _sse(user_id, body, profile, extra_system, host_tools, tenant, reasoning_effort),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -462,12 +509,19 @@ async def chat_completions(
                 "X-Accel-Buffering": "no",  # disable nginx buffering for SSE
             },
         )
-    return await _collect(user_id, body, profile, extra_system, host_tools, tenant)
+    return await _collect(user_id, body, profile, extra_system, host_tools, tenant, reasoning_effort)
 
 
 @app.get("/v1/models")
 async def models():
-    return {"object": "list", "data": [{"id": config.MODEL, "object": "model", "owned_by": "proteus"}]}
+    # Gateway default first, then every agent's primary model — clients that
+    # list models should see what Qubi (etc.) actually runs, not only MODEL.
+    ids: list[str] = []
+    for mid in [config.MODEL, *(a.model for a in profiles.all_agents().values() if a.model)]:
+        if mid and mid not in ids:
+            ids.append(mid)
+    return {"object": "list",
+            "data": [{"id": mid, "object": "model", "owned_by": "proteus"} for mid in ids]}
 
 
 @app.get("/metrics")

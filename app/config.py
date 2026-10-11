@@ -107,7 +107,19 @@ WORKERS = _int("WORKERS", 4)
 # Model (provider-prefixed, LiteLLM style: anthropic/…, openai/…, ollama/…, openrouter/…)
 MODEL = os.environ.get("MODEL", "anthropic/claude-sonnet-4-6").strip()
 MAX_TOKENS = _int("MAX_TOKENS", 1500)
+# Hard cap on reasoning tokens for reasoning models that cannot turn reasoning
+# off (e.g. GLM 5.3 Flash via OpenRouter, which 400s if you try). Those tokens
+# are billed and counted against MAX_TOKENS, so without a cap the model can spend
+# its whole budget thinking and return finish_reason=length with no visible text.
+# Capping reasoning reserves the rest of MAX_TOKENS for the answer. 0 = disabled
+# (the default); an agent's `reasoning_max_tokens:` frontmatter overrides this.
+REASONING_MAX_TOKENS = _int("REASONING_MAX_TOKENS", 0)
 MAX_TOOL_TURNS = _int("MAX_TOOL_TURNS", 8)
+# Seconds into a reply after which it stops calling tools and answers from what
+# it has. 0 = no time limit, only MAX_TOOL_TURNS. An agent's
+# `tool_time_budget:` frontmatter overrides this, and `tool_rounds:` overrides
+# MAX_TOOL_TURNS.
+TOOL_TIME_BUDGET = _int("TOOL_TIME_BUDGET", 0)
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.3") or 0.3)
 # Hard ceiling on one upstream completion. A reasoning model on a long answer can
 # legitimately run minutes, so this is generous; its job is to stop a *stalled*
@@ -145,6 +157,21 @@ PROMPT_CACHING = os.environ.get("PROMPT_CACHING", "true").lower() not in ("0", "
 # Provider API keys are read by LiteLLM directly from the environment
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, …).
 # python-dotenv has already loaded them; nothing else to wire up here.
+
+# OpenRouter provider routing, applied to `openrouter/…` models only. Which
+# provider serves a request is the biggest single factor in how fast it feels
+# (see the measurements in llm.py), so name the one you want.
+#   OPENROUTER_PROVIDER_ORDER=baseten/fp8       preferred providers, in order
+#   OPENROUTER_PROVIDER_SORT=throughput         or latency / price
+#   OPENROUTER_ALLOW_FALLBACKS=true             use others when preferred is down
+# Leave the first two empty for OpenRouter's own default routing.
+OPENROUTER_PROVIDER_ORDER = [
+    s.strip() for s in os.environ.get("OPENROUTER_PROVIDER_ORDER", "").split(",") if s.strip()
+]
+OPENROUTER_PROVIDER_SORT = os.environ.get("OPENROUTER_PROVIDER_SORT", "").strip()
+OPENROUTER_ALLOW_FALLBACKS = os.environ.get(
+    "OPENROUTER_ALLOW_FALLBACKS", "true"
+).lower() not in ("0", "false", "no")
 
 # Kimi Code — Moonshot's coding endpoint. OpenAI-compatible but on its own host
 # with its own key, so it cannot just be `openai/…`: pointing OPENAI_API_BASE at

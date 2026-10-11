@@ -144,6 +144,20 @@ def load_for(toolset_str: str, host_tools: bool = False) -> tuple[list[dict] | N
     async def combined(tool_name: str, user_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if tool_name in HOST_TOOLS and not host_tools:
             return {"error": f"{tool_name} is not available to this caller"}
+        # Alias for a hallucinated tool name: models sometimes emit
+        # `news_search` when they mean `web_search`. The advertised schema
+        # stays `web_search` only, but the call still works instead of
+        # erroring as "unknown tool" (which models paraphrase as "down").
+        if tool_name == "news_search":
+            dispatch = routing.get("web_search")
+            if dispatch is None:
+                return {"error": "unknown tool: news_search (did you mean web_search?)"}
+            args = dict(args or {})
+            args.setdefault("query", args.pop("q", ""))
+            out = await dispatch("web_search", user_id, args)
+            if isinstance(out, dict):
+                out.setdefault("alias", "news_search->web_search")
+            return out
         dispatch = routing.get(tool_name)
         if dispatch is None:
             return {"error": f"unknown tool: {tool_name}"}

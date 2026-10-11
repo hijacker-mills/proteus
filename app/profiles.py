@@ -14,7 +14,7 @@ on `host_tools` as well as the name.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import agents_store, config, toolsets
 
@@ -48,6 +48,69 @@ def _pick(name: str | None) -> agents_store.Agent | None:
         if candidate and candidate in agents:
             return agents[candidate]
     return next(iter(agents.values()))          # last resort: any defined agent
+
+
+class ModelChoice(NamedTuple):
+    """Which model answers for a profile, and what to try if it fails."""
+    model: str
+    fallbacks: list[str]
+    max_tokens: int
+    reasoning_max_tokens: int | None = None
+    reasoning_effort: str | None = None
+
+    @property
+    def chain(self) -> list[str]:
+        return [self.model, *self.fallbacks]
+
+
+def model_for(name: str | None) -> ModelChoice:
+    """The model settings for a profile, falling back to the global config.
+
+    Separate from `resolve()` on purpose. `resolve()` answers "what does this
+    agent say and what can it do", which is cached per (name, host_tools); this
+    answers "what runs it", which is cheap and needs no cache.
+
+    Until this existed, `model:` and `max_tokens:` in agent frontmatter were
+    parsed by `agents_store`, printed by `proteus agent list`, and then ignored:
+    `agent.run` always called the global MODEL. An agent file could ask for a
+    model and be silently overruled.
+
+    Never raises. A gateway that cannot read an agent file should answer on the
+    default model, not 500.
+    """
+    try:
+        agent = _pick(name)
+    except Exception:                            # pragma: no cover - defensive
+        agent = None
+    if agent is None:
+        return ModelChoice(config.MODEL, [], config.MAX_TOKENS,
+                           config.REASONING_MAX_TOKENS or None, None)
+    # effort and max_tokens are mutually exclusive on OpenRouter; effort wins
+    # when the agent asks for both.
+    effort = agent.reasoning_effort
+    return ModelChoice(
+        agent.model or config.MODEL,
+        list(agent.fallbacks),
+        agent.max_tokens or config.MAX_TOKENS,
+        None if effort else (agent.reasoning_max_tokens
+                             or config.REASONING_MAX_TOKENS or None),
+        effort,
+    )
+
+
+def tool_budget_for(name: str | None) -> tuple[int, int]:
+    """(tool rounds, seconds) one reply may spend calling tools for a profile.
+
+    The seconds are 0 when there is no time limit. Never raises, for the same
+    reason as `model_for`.
+    """
+    try:
+        agent = _pick(name)
+    except Exception:                            # pragma: no cover - defensive
+        agent = None
+    rounds = (agent.tool_rounds if agent else None) or config.MAX_TOOL_TURNS
+    seconds = (agent.tool_time_budget if agent else None) or config.TOOL_TIME_BUDGET
+    return max(1, rounds), max(0, seconds)
 
 
 def resolve(name: str | None, host_tools: bool = False):

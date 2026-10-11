@@ -130,6 +130,12 @@ async def dispatch(name: str, user_id: str, args: dict[str, Any]) -> dict[str, A
     args = args or {}
     if name == "web_search":
         return await web.web_search(args.get("query", ""), int(args.get("count", 5) or 5))
+    if name == "news_search":
+        # Alias: models sometimes emit `news_search` for `web_search`.
+        out = await web.web_search(args.get("query", args.get("q", "")), int(args.get("count", 5) or 5))
+        if isinstance(out, dict):
+            out.setdefault("alias", "news_search->web_search")
+        return out
     if name == "web_fetch":
         return await web.web_fetch(args.get("url", ""))
     if name == "run_code":
