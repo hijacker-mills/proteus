@@ -40,15 +40,23 @@ _GAVE_UP = ("_(That took more lookups than I can do in one reply. Ask again "
 
 def _prepare(messages: list[dict[str, Any]], extra_system: str, system_prompt: str) -> list[dict[str, Any]]:
     """Build the OpenAI-format message list: our system prompt first, then turns.
-    Any system messages already in the history are folded into the system prompt."""
+    Any system messages already in the history are folded into the system prompt.
+
+    System messages sent AFTER the last turn are this turn's context (the
+    evidence for this question, an attachment, the time). They go after the
+    clock, in the volatile tail, so the stable part stays a cacheable prefix
+    and llm._apply_cache_breakpoint can move the whole tail next to the
+    question for providers that cache on a breakpoint."""
+    last_turn = max((i for i, m in enumerate(messages) if m.get("role") in ("user", "assistant", "tool")), default=-1)
     folded: list[str] = []
+    turn_context: list[str] = []
     convo: list[dict[str, Any]] = []
-    for m in messages:
+    for i, m in enumerate(messages):
         role = m.get("role")
         content = m.get("content", "")
         if role == "system":
             if isinstance(content, str) and content.strip():
-                folded.append(content.strip())
+                (turn_context if i > last_turn else folded).append(content.strip())
         elif role in ("user", "assistant", "tool"):
             convo.append(m)
 
@@ -68,6 +76,8 @@ def _prepare(messages: list[dict[str, Any]], extra_system: str, system_prompt: s
     # providers needing an explicit cache breakpoint find the stable/volatile
     # boundary again, so the two must stay in sync.
     system += llm.CLOCK_PREFIX + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "."
+    for part in turn_context:
+        system += "\n\n" + part
     return [{"role": "system", "content": system}, *convo]
 
 
