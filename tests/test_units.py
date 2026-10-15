@@ -397,7 +397,10 @@ def test_pack_python_tool_can_import_its_own_helper(tmp_pack):
 
 # ── prompt cache breakpoint ──────────────────────────────────────────────────
 
-def test_cache_breakpoint_splits_stable_from_volatile():
+EPH = {"type": "ephemeral"}
+
+
+def test_cache_breakpoint_keeps_the_tail_in_the_system_with_no_user_turn():
     from app import llm
 
     messages = [{"role": "system", "content": "PERSONA" + llm.CLOCK_PREFIX + "12:00 UTC."}]
@@ -405,13 +408,114 @@ def test_cache_breakpoint_splits_stable_from_volatile():
     out_msgs, out_tools = llm._apply_cache_breakpoint(messages, tools)
 
     blocks = out_msgs[0]["content"]
-    assert len(blocks) == 2
-    assert "cache_control" in blocks[0] and "cache_control" not in blocks[1]
-    assert blocks[0]["text"] == "PERSONA"
+    assert blocks[0] == {"type": "text", "text": "PERSONA", "cache_control": EPH}
+    assert blocks[1] == {"type": "text", "text": "Current time: 12:00 UTC."}
     assert "cache_control" in out_tools[-1] and "cache_control" not in out_tools[0]
     # inputs untouched, because the caller reuses them across tool turns
     assert isinstance(messages[0]["content"], str)
     assert "cache_control" not in tools[-1]
+
+
+def test_cache_breakpoint_moves_the_volatile_tail_after_the_question():
+    from app import llm
+
+    messages = [
+        {"role": "system", "content": "PERSONA" + llm.CLOCK_PREFIX + "12:00 UTC.\n\nEVIDENCE"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+    ]
+    out_msgs, _ = llm._apply_cache_breakpoint(messages, None)
+
+    assert out_msgs[0]["content"] == [{"type": "text", "text": "PERSONA", "cache_control": EPH}]
+    assert out_msgs[1]["content"] == "first"
+    assert out_msgs[3]["content"] == [
+        {"type": "text", "text": "second", "cache_control": EPH},
+        {"type": "text", "text": "<system-reminder>\nCurrent time: 12:00 UTC.\n\nEVIDENCE\n</system-reminder>"},
+    ]
+    assert messages[3]["content"] == "second"
+
+
+def test_cache_breakpoint_next_turn_shares_the_prefix():
+    """What makes the cross-turn hit: everything up to the old breakpoint is
+    sent again byte for byte, even though the clock and evidence changed."""
+    from app import llm
+
+    turn1 = [
+        {"role": "system", "content": "P" + llm.CLOCK_PREFIX + "12:00 UTC.\n\nEV1"},
+        {"role": "user", "content": "q1"},
+    ]
+    turn2 = [
+        {"role": "system", "content": "P" + llm.CLOCK_PREFIX + "12:07 UTC.\n\nEV2"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+    ]
+    out1, _ = llm._apply_cache_breakpoint(turn1, None)
+    out2, _ = llm._apply_cache_breakpoint(turn2, None)
+
+    assert out1[0] == out2[0]
+    assert out1[1]["content"][0] == {"type": "text", "text": "q1", "cache_control": EPH}
+    assert out2[1]["content"] == "q1"
+
+
+def test_cache_breakpoint_marks_the_question_and_the_newest_tool_result():
+    from app import llm
+
+    messages = [
+        {"role": "system", "content": "PERSONA" + llm.CLOCK_PREFIX + "now."},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "result"},
+    ]
+    out_msgs, _ = llm._apply_cache_breakpoint(messages, None)
+
+    assert out_msgs[1]["content"][0] == {"type": "text", "text": "q", "cache_control": EPH}
+    assert out_msgs[1]["content"][1]["text"].startswith("<system-reminder>")
+    assert out_msgs[3]["content"] == [{"type": "text", "text": "result", "cache_control": EPH}]
+    assert messages[3]["content"] == "result"
+
+
+def test_cache_breakpoint_leaves_an_image_question_unmarked_but_keeps_the_tail():
+    from app import llm
+
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+    messages = [
+        {"role": "system", "content": "P" + llm.CLOCK_PREFIX + "now."},
+        {"role": "user", "content": [image]},
+    ]
+    out_msgs, _ = llm._apply_cache_breakpoint(messages, None)
+
+    assert out_msgs[1]["content"][0] == image
+    assert "now." in out_msgs[1]["content"][1]["text"]
+
+
+def test_cache_breakpoint_skips_a_trailing_assistant_turn():
+    from app import llm
+
+    messages = [{"role": "system", "content": "S"}, {"role": "assistant", "content": "prefill"}]
+    out_msgs, _ = llm._apply_cache_breakpoint(messages, None)
+    assert out_msgs[1]["content"] == "prefill"
+
+
+def test_prepare_puts_trailing_system_messages_after_the_clock():
+    from app import agent, llm
+
+    out = agent._prepare(
+        [
+            {"role": "system", "content": "SCOPE"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "system", "content": "EVIDENCE"},
+        ],
+        "",
+        "PERSONA",
+    )
+    stable, _, tail = out[0]["content"].partition(llm.CLOCK_PREFIX)
+    assert stable == "PERSONA\n\nSCOPE"
+    assert tail.endswith("\n\nEVIDENCE")
+    assert [m["content"] for m in out[1:]] == ["q1", "a1", "q2"]
 
 
 def test_only_explicit_cache_providers_are_targeted():
