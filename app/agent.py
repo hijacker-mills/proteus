@@ -38,6 +38,19 @@ _GAVE_UP = ("_(That took more lookups than I can do in one reply. Ask again "
             "with a narrower question and I'll finish the job.)_")
 
 
+def _round_break(tail: str, text: str) -> str:
+    """What goes between the reply so far and a new model call's first words.
+
+    Each tool round is its own model call, and its text arrives right after the
+    last one's, so a line written before a tool call ran into the answer after
+    it ("I'll use that one.You have 5 cards due", 2026-10-21). `tail` is the
+    last character already sent. Whitespace on either side means the model
+    already left a gap."""
+    if not tail or tail.isspace() or text[:1].isspace():
+        return ""
+    return "\n\n"
+
+
 def _prepare(messages: list[dict[str, Any]], extra_system: str, system_prompt: str) -> list[dict[str, Any]]:
     """Build the OpenAI-format message list: our system prompt first, then turns.
     Any system messages already in the history are folded into the system prompt.
@@ -115,6 +128,8 @@ async def run(
     totals: dict[str, int] = {}
     # Last model that actually produced output for this run (tracks fallbacks).
     active_model = choice.model
+    # Last character sent, across rounds, for _round_break.
+    tail = ""
 
     def add_usage(u: dict[str, int] | None) -> None:
         for key, value in (u or {}).items():
@@ -130,6 +145,7 @@ async def run(
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
             finish_reason: str | None = None
+            opened = False
             must_answer = turn == tool_rounds or (
                 tool_seconds > 0 and turn > 0 and time.monotonic() - started > tool_seconds)
             if must_answer:
@@ -146,8 +162,15 @@ async def run(
                 tool_choice="none" if must_answer else "auto",
             ):
                 if ev["type"] == "text":
-                    text_parts.append(ev["text"])
-                    yield {"type": "text", "text": ev["text"]}
+                    text = ev["text"]
+                    if not text:
+                        continue
+                    text_parts.append(text)
+                    if not opened:
+                        text = _round_break(tail, text) + text
+                        opened = True
+                    tail = text[-1]
+                    yield {"type": "text", "text": text}
                 elif ev["type"] == "final":
                     tool_calls = ev["tool_calls"]
                     finish_reason = ev.get("finish_reason")
@@ -159,7 +182,7 @@ async def run(
                 # A provider that ignored tool_choice still gets no more tools.
                 tool_calls = []
                 if not text_parts and finish_reason != "length":
-                    yield {"type": "text", "text": _GAVE_UP}
+                    yield {"type": "text", "text": _round_break(tail, _GAVE_UP) + _GAVE_UP}
 
             if not tool_calls:
                 # A reasoning model can burn its whole token budget thinking and
