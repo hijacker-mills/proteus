@@ -72,6 +72,19 @@ def _render_payload(tool: str, result: Any) -> dict[str, Any] | None:
             if value:
                 video[key] = str(value)[:limit]
         return {"video": video}
+    if tool == "diagram":
+        # A branded SVG the client draws natively (react-native-svg). The tool
+        # returns svg=null when there was no structure worth drawing; nothing to
+        # ship then. Capped for SSE size — diagrams are a few KB by design.
+        svg = result.get("svg")
+        if not isinstance(svg, str) or not svg.strip():
+            return None
+        payload: dict[str, Any] = {"svg": svg[:40000]}
+        if result.get("alt"):
+            payload["alt"] = str(result["alt"])[:200]
+        if result.get("caption"):
+            payload["caption"] = str(result["caption"])[:200]
+        return payload
     return None
 
 

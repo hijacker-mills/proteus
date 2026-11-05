@@ -14,12 +14,15 @@ only on `astream()` and its normalized event shape.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, AsyncGenerator
 
 import litellm
 
 from . import config
+
+logger = logging.getLogger("proteus.llm")
 
 # Keep the gateway quiet and resilient across heterogeneous providers.
 litellm.telemetry = False
@@ -40,30 +43,76 @@ CLOCK_PREFIX = "\n\nCurrent time: "
 _EXPLICIT_CACHE_PREFIXES = ("anthropic/", "bedrock/anthropic", "vertex_ai/claude")
 
 
-def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None):
-    """Mark the stable head of the system prompt (and the tool schemas) cacheable.
+def _cache_marked(block: dict[str, Any]) -> dict[str, Any]:
+    return {**block, "cache_control": {"type": "ephemeral"}}
 
-    Anthropic caches only up to an explicit `cache_control` breakpoint, so the
-    marker goes on the STABLE half of the system prompt. Marking the whole thing
-    would include the clock and re-write the cache every minute, which costs
-    more than it saves.
+
+def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None):
+    """Lay the request out so Anthropic can cache everything but this turn.
+
+    Anthropic caches only up to an explicit `cache_control` breakpoint, and a
+    breakpoint covers everything before it, tools then system then messages.
+    So the volatile tail of the system prompt (the clock, and this turn's
+    context: evidence, attachments) cannot stay in the system prompt: it would
+    sit ahead of the history and every turn would re-pay for the whole
+    conversation. It moves instead into a trailing block of the newest user
+    message, after a breakpoint on the user's own words. The next turn sends
+    that same message without the block, so its prefix up to the old
+    breakpoint is byte-identical and is read back at a tenth of the price.
+
+    Breakpoints (Anthropic allows four): the last tool schema, the stable
+    system prompt, the newest user message, and in a tool round the newest
+    tool result, so each round reads the earlier ones back.
 
     Returns new lists; the originals are left alone because the caller may reuse
     them across tool-loop turns.
     """
     out_msgs = list(messages)
+    volatile = ""
+    system_at = -1
     for i, m in enumerate(out_msgs):
         if m.get("role") != "system" or not isinstance(m.get("content"), str):
             continue
-        stable, sep, volatile = m["content"].rpartition(CLOCK_PREFIX)
-        blocks = (
-            [{"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
-             {"type": "text", "text": sep + volatile}]
-            if sep else
-            [{"type": "text", "text": m["content"], "cache_control": {"type": "ephemeral"}}]
-        )
-        out_msgs[i] = {**m, "content": blocks}
+        stable, sep, tail = m["content"].rpartition(CLOCK_PREFIX)
+        if not sep:
+            stable = m["content"]
+        else:
+            volatile = (sep + tail).strip()
+        system_at = i
+        out_msgs[i] = {**m, "content": [_cache_marked({"type": "text", "text": stable})]}
         break
+
+    last_user = max((i for i, m in enumerate(out_msgs) if m.get("role") == "user"), default=-1)
+    if last_user >= 0:
+        m = out_msgs[last_user]
+        content = m.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}] if content else []
+        if isinstance(content, list):
+            content = list(content)
+            if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
+                content[-1] = _cache_marked(content[-1])
+            if volatile:
+                content.append({"type": "text", "text": f"<system-reminder>\n{volatile}\n</system-reminder>"})
+                volatile = ""
+            out_msgs[last_user] = {**m, "content": content}
+    if volatile:
+        # Nowhere to put it (no user message, or a content shape we don't
+        # know): leave the tail in the system prompt rather than drop it. That
+        # costs the cross-turn cache, never correctness.
+        sm = out_msgs[system_at]
+        out_msgs[system_at] = {**sm, "content": [*sm["content"], {"type": "text", "text": volatile}]}
+
+    # In a tool round the newest message is a tool result. Marking it caches
+    # this turn's rounds so far for the next round.
+    last = len(out_msgs) - 1
+    if last > last_user and out_msgs[last].get("role") == "tool":
+        m = out_msgs[last]
+        content = m.get("content")
+        if isinstance(content, str) and content:
+            out_msgs[last] = {**m, "content": [_cache_marked({"type": "text", "text": content})]}
+        elif isinstance(content, list) and content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
+            out_msgs[last] = {**m, "content": [*content[:-1], _cache_marked(content[-1])]}
 
     out_tools = tools
     if tools:
@@ -111,6 +160,7 @@ async def astream(
     max_tokens: int,
     temperature: float,
     reasoning_effort: str | None = None,
+    reasoning_max_tokens: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Stream one model completion. Yields normalized events:
@@ -164,6 +214,43 @@ async def astream(
 
     if config.PROMPT_CACHING and model.startswith(_EXPLICIT_CACHE_PREFIXES):
         messages, tools = _apply_cache_breakpoint(messages, tools)
+
+    # OpenRouter fronts several providers per model and picks one per request,
+    # and they are NOT interchangeable on speed. Measured on
+    # z-ai/glm-5.3-flash, same prompt, same params: 0.6-0.8s when Baseten
+    # served it and 15-17s when a slower provider did, with the unpinned
+    # default sitting around 10s. That spread is the single biggest lever on
+    # how Qubi feels, so it is worth naming the provider you want.
+    #
+    # `allow_fallbacks` defaults ON deliberately. Pinning hard with fallbacks
+    # off returns a bare 429 the moment the preferred provider's shared pool is
+    # rate-limited, which it demonstrably is:
+    #   "z-ai/glm-5.3-flash is temporarily rate-limited upstream"
+    # A slow answer beats no answer. To get the fast path consistently, attach
+    # your own provider key in OpenRouter's integrations settings; that leaves
+    # the shared pool and its limits behind.
+    if model.startswith("openrouter/"):
+        routing: dict[str, Any] = {}
+        if config.OPENROUTER_PROVIDER_ORDER:
+            routing["order"] = config.OPENROUTER_PROVIDER_ORDER
+        if config.OPENROUTER_PROVIDER_SORT:
+            routing["sort"] = config.OPENROUTER_PROVIDER_SORT
+        extra_body: dict[str, Any] = {}
+        if routing:
+            routing["allow_fallbacks"] = config.OPENROUTER_ALLOW_FALLBACKS
+            extra_body["provider"] = routing
+        # Bound or steer reasoning. OpenRouter accepts only ONE of
+        # reasoning.effort / reasoning.max_tokens — sending both is HTTP 400.
+        # effort wins when the agent asks for both.
+        if reasoning_effort:
+            extra_body["reasoning"] = {"effort": reasoning_effort}
+        elif reasoning_max_tokens:
+            extra_body["reasoning"] = {"max_tokens": reasoning_max_tokens}
+        if extra_body:
+            extra_kwargs = {**extra_kwargs, "extra_body": extra_body}
+    elif reasoning_effort:
+        # Non-OpenRouter providers that understand the unified effort param.
+        extra_kwargs = {**extra_kwargs, "reasoning_effort": reasoning_effort}
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -242,7 +329,65 @@ async def astream(
         })
 
     yield {"type": "final", "tool_calls": tool_calls,
-           "finish_reason": finish_reason, "usage": usage}
+           "finish_reason": finish_reason, "usage": usage, "model": model}
+
+
+async def astream_chain(
+    models: list[str],
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    max_tokens: int,
+    temperature: float,
+    reasoning_effort: str | None = None,
+    reasoning_max_tokens: int | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Stream `models[0]`, falling through to the next one if it fails.
+
+    Same normalized event contract as `astream`; this only decides WHICH model
+    produces them.
+
+    THE RULE: a model is abandoned only if it fails before yielding anything.
+    Once one event is out, the caller has it — the HTTP layer has already
+    flushed those tokens to the student's screen — and re-running the turn on
+    another model would either duplicate the text or contradict it mid-sentence.
+    So a mid-stream failure propagates, exactly as it did before fallbacks
+    existed. Fallbacks buy availability at connect time, not a redo.
+
+    Deliberately not LiteLLM's own `fallbacks=` kwarg: that routes through
+    `completion_with_fallbacks`, whose behaviour around streaming and our
+    normalized events varies by version. Being explicit here makes the rule
+    above readable and testable, and keeps `astream` a single-model primitive.
+
+    `astream` is looked up as a module global on each attempt, so tests that
+    monkeypatch `llm.astream` still intercept every call.
+    """
+    chain = [m for m in models if m]
+    if not chain:
+        chain = [config.MODEL]
+
+    for index, model in enumerate(chain):
+        started = False
+        try:
+            async for event in astream(
+                model=model,
+                messages=messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                reasoning_max_tokens=reasoning_max_tokens,
+            ):
+                started = True
+                yield event
+            return
+        except Exception as exc:
+            remaining = chain[index + 1:]
+            if started or not remaining:
+                raise
+            logger.warning(
+                "model %s failed before producing output (%s: %s) — falling back to %s",
+                model, type(exc).__name__, str(exc)[:200], remaining[0],
+            )
 
 
 async def close() -> None:
