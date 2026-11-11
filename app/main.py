@@ -255,6 +255,12 @@ def _resolve_reasoning_effort(body: dict[str, Any]) -> str | None:
     return None
 
 
+def _tools_off(body: dict[str, Any]) -> bool:
+    """A caller's tool_choice "none" runs the turn with no tools at all (see
+    agent.run). Anything else leaves the agent's tools as they are."""
+    return body.get("tool_choice") == "none"
+
+
 def _record(tenant: str, mode: str, total: float, ttft: float | None,
             usage: dict, tools: int) -> None:
     """One place that turns a finished turn into metrics."""
@@ -332,7 +338,8 @@ async def _sse(user_id: str, body: dict[str, Any], profile: str | None = None,
         yield _chunk(chat_id, created, model=response_model, delta={"role": "assistant"})
         async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system,
                                   profile=profile, host_tools=host_tools,
-                                  reasoning_effort_override=reasoning_effort):
+                                  reasoning_effort_override=reasoning_effort,
+                                  tools_off=_tools_off(body)):
             if ev["type"] == "text":
                 first_token = ttft is None
                 if first_token:
@@ -412,7 +419,8 @@ async def _collect(user_id: str, body: dict[str, Any], profile: str | None = Non
     try:
         async for ev in agent.run(user_id, body.get("messages", []), extra_system=extra_system,
                                   profile=profile, host_tools=host_tools,
-                                  reasoning_effort_override=reasoning_effort):
+                                  reasoning_effort_override=reasoning_effort,
+                                  tools_off=_tools_off(body)):
             if ev["type"] == "text":
                 text_parts.append(ev["text"])
             elif ev["type"] == "tool":
