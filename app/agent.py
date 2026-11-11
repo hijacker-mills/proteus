@@ -101,14 +101,23 @@ async def run(
     profile: str | None = None,
     host_tools: bool = False,
     reasoning_effort_override: str | None = None,
+    tools_off: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """`host_tools` grants the caller shell/run_code/email/schedule. It defaults
     to False and must be an explicit decision by the entry point (see
     toolsets.HOST_TOOLS) — the profile alone never unlocks host access.
     `reasoning_effort_override` lets a caller that already knows a turn is
     trivial (a greeting, a thank-you) ask for less thinking than the agent's
-    configured effort. It never raises the effort above the agent's own."""
+    configured effort. It never raises the effort above the agent's own.
+    `tools_off` sends this turn with no tools at all, for a caller that already
+    put what the answer needs in the prompt."""
     system_prompt, tools, dispatch = profiles.resolve(profile, host_tools=host_tools)
+    # Claude takes about 0.35 s longer to its first word when a request carries
+    # any tools, even one, even with tool_choice none, so "none" alone does not
+    # buy that back. A history that already holds tool calls keeps them: the
+    # Messages API rejects tool blocks with no tools defined.
+    if tools_off and not any(m.get("role") == "tool" or m.get("tool_calls") for m in messages):
+        tools = None
     # Which model runs this profile. An agent file may name its own, and its own
     # fallbacks; both default to the gateway's MODEL / MAX_TOKENS.
     choice = profiles.model_for(profile)

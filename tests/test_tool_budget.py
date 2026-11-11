@@ -136,3 +136,52 @@ def test_budget_frontmatter(tmp_agents, frontmatter, rounds, seconds):
     assert (agent.tool_rounds, agent.tool_time_budget) == (rounds, seconds)
     assert profiles.tool_budget_for("b") == (rounds or config.MAX_TOOL_TURNS,
                                             seconds or config.TOOL_TIME_BUDGET)
+
+
+def _tools_sent(monkeypatch, tmp_agents, messages, **run_kw):
+    """The tools agent.run hands the model on its first call."""
+    from app import agent, llm, profiles
+
+    write_agent(tmp_agents, "tutor", "name: tutor\n")
+    sent = []
+
+    async def astream(*, model, messages, tools, tool_choice="auto", **_):
+        sent.append(tools)
+        yield {"type": "text", "text": "answer"}
+        yield {"type": "final", "tool_calls": [], "finish_reason": "stop", "usage": {}}
+
+    async def dispatch(*_):                          # pragma: no cover - never called
+        raise AssertionError
+
+    monkeypatch.setattr(profiles, "resolve", lambda name, host_tools=False: ("sys", [TOOL], dispatch))
+    monkeypatch.setattr(llm, "astream", astream)
+
+    async def collect():
+        return [ev async for ev in agent.run("u1", messages, profile="tutor", **run_kw)]
+    asyncio.run(collect())
+    return sent[0]
+
+
+def test_tools_off_sends_the_turn_with_no_tools(monkeypatch, tmp_agents):
+    question = [{"role": "user", "content": "what is osmosis?"}]
+    assert _tools_sent(monkeypatch, tmp_agents, question) == [TOOL]
+    assert _tools_sent(monkeypatch, tmp_agents, question, tools_off=True) is None
+
+
+def test_tools_off_keeps_tools_when_the_history_has_tool_calls(monkeypatch, tmp_agents):
+    history = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        {"role": "user", "content": "q2"},
+    ]
+    assert _tools_sent(monkeypatch, tmp_agents, history, tools_off=True) == [TOOL]
+
+
+def test_request_tool_choice_none_turns_tools_off():
+    from app import main
+
+    assert main._tools_off({"tool_choice": "none"}) is True
+    assert main._tools_off({"tool_choice": "auto"}) is False
+    assert main._tools_off({}) is False
