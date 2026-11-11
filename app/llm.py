@@ -184,6 +184,16 @@ async def astream(
     if tool_choice == "none" and model.startswith(("codex/", "openai-codex/", "mock/")):
         tools = None
 
+    # "none" asks for an answer with no thinking first. Claude 5 models think
+    # adaptively at every effort, and on Qubi's everyday turns about one in ten
+    # chose to, which put first text at 3 to 4 s instead of under one. The
+    # Messages API switches that off with thinking type "between_tools" (the
+    # model still writes short notes between tool calls). Every other provider
+    # gets low, so a fallback model answers as it did before "none" existed.
+    thinking_off = reasoning_effort == "none"
+    if thinking_off:
+        reasoning_effort = "low"
+
     # Codex (ChatGPT OAuth) is not a LiteLLM provider — route it to our own
     # Responses-API client. Same normalized event contract, so callers don't care.
     if model.startswith("codex/") or model.startswith("openai-codex/"):
@@ -260,6 +270,10 @@ async def astream(
     elif reasoning_effort:
         # Non-OpenRouter providers that understand the unified effort param.
         extra_kwargs = {**extra_kwargs, "reasoning_effort": reasoning_effort}
+        # LiteLLM keeps an explicit `thinking` and still sends the effort as
+        # output_config, so this is thinking off at low effort.
+        if thinking_off and model.startswith("anthropic/"):
+            extra_kwargs["thinking"] = {"type": "between_tools"}
 
     kwargs: dict[str, Any] = {
         "model": model,
