@@ -166,13 +166,17 @@ the web…" or a result card live without a second channel.
 data: {"id":"chatcmpl-…","choices":[{"delta":{"content":"Photo"},"index":0}]}
 data: {"id":"chatcmpl-…","choices":[{"delta":{},"index":0}],
        "proteus_tool_event":{"ts":1787004212975,"userId":"alice","tool":"web_search",
-                          "status":"ok","ms":412,"query":"…","hits":5}}
+                          "status":"ok","ms":412,"query":"…","hits":5,
+                          "data":{"query":"…"}}}
 data: [DONE]
 ```
 
 Non-streaming responses collect the same events into a `proteus_tool_events` array.
 A tool may also attach a small render payload on `event.data`, so a UI can draw
 a card from the real result instead of re-parsing it out of the model's prose.
+A tool called with a `query` gets it in `event.data.query` too, on every status.
+`lecture_evidence` sends the lectures it found as
+`data.items: [{lectureId, title}]`, one per lecture, and never the passages.
 Set `REDIS_URL` to also mirror every event to a Redis stream for audit and
 analytics.
 
