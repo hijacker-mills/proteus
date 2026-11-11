@@ -238,7 +238,9 @@ def _resolve_mode(body: dict[str, Any], header_mode: str | None) -> str | None:
     return None
 
 
-_VALID_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+# "none" is answer-without-thinking (see llm.astream); it falls to low on
+# providers that cannot switch thinking off.
+_VALID_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high"})
 
 
 def _resolve_reasoning_effort(body: dict[str, Any]) -> str | None:

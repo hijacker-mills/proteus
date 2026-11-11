@@ -756,3 +756,56 @@ def test_identity_proof_older_than_two_minutes_is_refused(monkeypatch):
     signature = hmac.new(secret.encode(), f"user-123:{timestamp}".encode(), hashlib.sha256).hexdigest()
     with pytest.raises(Exception, match="expired user identity proof"):
         main._verify_identity("user-123", timestamp, signature)
+
+
+# ── reasoning effort ─────────────────────────────────────────────────────────
+
+def _sent_kwargs(monkeypatch, model, effort):
+    """The kwargs astream hands LiteLLM for one call, with no network."""
+    from app import llm
+
+    sent = {}
+
+    async def fake_acompletion(**kwargs):
+        sent.update(kwargs)
+
+        async def empty():
+            return
+            yield
+
+        return empty()
+
+    monkeypatch.setattr(llm.litellm, "acompletion", fake_acompletion)
+
+    async def run():
+        async for _ in llm.astream(model, [{"role": "user", "content": "hi"}], None, 100, 0.3,
+                                   reasoning_effort=effort):
+            pass
+
+    asyncio.run(run())
+    return sent
+
+
+def test_effort_none_turns_claude_thinking_off(monkeypatch):
+    sent = _sent_kwargs(monkeypatch, "anthropic/claude-sonnet-5-5", "none")
+    assert sent["thinking"] == {"type": "between_tools"}
+    assert sent["reasoning_effort"] == "low"
+
+
+def test_effort_none_is_low_on_other_providers(monkeypatch):
+    sent = _sent_kwargs(monkeypatch, "openrouter/openai/gpt-6-luna-pro", "none")
+    assert sent["extra_body"]["reasoning"] == {"effort": "low"}
+    assert "thinking" not in sent
+
+
+def test_effort_low_keeps_claude_adaptive_thinking(monkeypatch):
+    sent = _sent_kwargs(monkeypatch, "anthropic/claude-sonnet-5-5", "low")
+    assert sent["reasoning_effort"] == "low"
+    assert "thinking" not in sent
+
+
+def test_request_effort_none_is_accepted():
+    from app import main
+
+    assert main._resolve_reasoning_effort({"reasoning_effort": "None"}) == "none"
+    assert main._resolve_reasoning_effort({"reasoning_effort": "off"}) is None
