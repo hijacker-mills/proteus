@@ -208,6 +208,7 @@ comments in [`.env.example`](.env.example); the essentials:
 | `CONCURRENCY_WAIT` | `20` | Seconds a request waits for a slot before being shed. |
 | `MAX_PARALLEL_TOOLS` | `8` | Tool calls run concurrently within one turn, up to this many. |
 | `PROMPT_CACHING` | `true` | Explicit cache breakpoint for providers that need one (Anthropic). Others cache automatically. |
+| `ANTHROPIC_FLAT_TOOL_HISTORY` | `false` | Send tool calls and results to `anthropic/*` models as labelled text. Sonnet 5.5 and Opus 5.5 return a reply in one block once the request holds a tool result; as text it streams. |
 | `STREAM_COALESCE_MS` | `0` | Batch SSE deltas into one frame for N ms. `0` = a frame per token. Never delays the first token. |
 | `MAX_TOOL_TURNS` | `8` | Tool-loop iterations before Proteus stops and says so. |
 

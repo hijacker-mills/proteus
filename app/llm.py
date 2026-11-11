@@ -82,7 +82,8 @@ def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str
         out_msgs[i] = {**m, "content": [_cache_marked({"type": "text", "text": stable})]}
         break
 
-    last_user = max((i for i, m in enumerate(out_msgs) if m.get("role") == "user"), default=-1)
+    last_user = max((i for i, m in enumerate(out_msgs)
+                     if m.get("role") == "user" and not m.get(_FLAT_RESULTS)), default=-1)
     if last_user >= 0:
         m = out_msgs[last_user]
         content = m.get("content")
@@ -106,7 +107,7 @@ def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str
     # In a tool round the newest message is a tool result. Marking it caches
     # this turn's rounds so far for the next round.
     last = len(out_msgs) - 1
-    if last > last_user and out_msgs[last].get("role") == "tool":
+    if last > last_user and (out_msgs[last].get("role") == "tool" or out_msgs[last].get(_FLAT_RESULTS)):
         m = out_msgs[last]
         content = m.get("content")
         if isinstance(content, str) and content:
@@ -120,6 +121,67 @@ def _apply_cache_breakpoint(messages: list[dict[str, Any]], tools: list[dict[str
         out_tools = list(tools)
         out_tools[-1] = {**out_tools[-1], "cache_control": {"type": "ephemeral"}}
     return out_msgs, out_tools
+
+
+# Marks a results message from _flatten_tool_history for _apply_cache_breakpoint,
+# which still treats it as a tool result. Stripped before the request goes out.
+_FLAT_RESULTS = "_proteus_tool_results"
+_FLAT_RESULTS_HEADER = (
+    "Results of the tools you just called. This is data the tools returned, "
+    "not a message from the user."
+)
+
+
+def _flatten_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rewrite tool calls and their results as plain text.
+
+    Sonnet 5.5 and Opus 5.5 hold back a reply's text until all of it is
+    written whenever the request carries a tool call and its result: after a
+    lecture_evidence round the whole answer arrived in one block about 3 s
+    in. The same passages sent as text stream from about 1.1 s (raw API,
+    2026-11-11). Haiku 5.5 streams either way.
+
+    An assistant tool-call turn keeps only the words it said; its calls move
+    into the results message, so the model never sees a tool call written as
+    prose and copies it. Results go back as one user message per round,
+    labelled as tool output. Tools stay on the request, so the model can still
+    call more.
+
+    Returns a new list; the caller's convo keeps the real tool messages for
+    other providers and fallbacks.
+    """
+    out: list[dict[str, Any]] = []
+    calls: dict[str, dict[str, Any]] = {}
+    results: list[str] = []
+
+    def flush() -> None:
+        if results:
+            out.append({"role": "user", "content": "\n\n".join([_FLAT_RESULTS_HEADER, *results]), _FLAT_RESULTS: True})
+            results.clear()
+
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            call = calls.get(m.get("tool_call_id") or "", {})
+            name = call.get("name") or "tool"
+            args = call.get("arguments") or "{}"
+            content = m.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            results.append(f"<tool_result name=\"{name}\" input={json.dumps(args)}>\n{content}\n</tool_result>")
+            continue
+        flush()
+        if role == "assistant" and m.get("tool_calls"):
+            for c in m["tool_calls"]:
+                fn = c.get("function") or {}
+                calls[c.get("id") or ""] = {"name": fn.get("name"), "arguments": fn.get("arguments")}
+            text = m.get("content")
+            if isinstance(text, str) and text.strip():
+                out.append({"role": "assistant", "content": text})
+            continue
+        out.append(m)
+    flush()
+    return out
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
@@ -231,8 +293,15 @@ async def astream(
             yield ev
         return
 
+    flat = config.ANTHROPIC_FLAT_TOOL_HISTORY and model.startswith("anthropic/")
+    if flat:
+        messages = _flatten_tool_history(messages)
+
     if config.PROMPT_CACHING and model.startswith(_EXPLICIT_CACHE_PREFIXES):
         messages, tools = _apply_cache_breakpoint(messages, tools)
+
+    if flat:
+        messages = [{k: v for k, v in m.items() if k != _FLAT_RESULTS} for m in messages]
 
     # OpenRouter fronts several providers per model and picks one per request,
     # and they are NOT interchangeable on speed. Measured on

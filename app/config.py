@@ -154,6 +154,10 @@ STREAM_COALESCE_MS = _int("STREAM_COALESCE_MS", 0)
 # via cache_control). Prefix-caching providers (OpenAI, the Codex Responses
 # backend) cache automatically and ignore this.
 PROMPT_CACHING = os.environ.get("PROMPT_CACHING", "true").lower() not in ("0", "false", "no")
+# Send tool calls and results to anthropic/* models as plain text. Sonnet 5.5
+# and Opus 5.5 hold a reply's text back until it is complete once the request
+# carries a tool result; as text it streams (llm._flatten_tool_history).
+ANTHROPIC_FLAT_TOOL_HISTORY = os.environ.get("ANTHROPIC_FLAT_TOOL_HISTORY", "false").lower() in ("1", "true", "yes")
 # Provider API keys are read by LiteLLM directly from the environment
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, …).
 # python-dotenv has already loaded them; nothing else to wire up here.
