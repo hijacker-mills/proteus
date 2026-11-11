@@ -809,3 +809,85 @@ def test_request_effort_none_is_accepted():
 
     assert main._resolve_reasoning_effort({"reasoning_effort": "None"}) == "none"
     assert main._resolve_reasoning_effort({"reasoning_effort": "off"}) is None
+
+
+# ── tool history as text for Claude ──────────────────────────────────────────
+
+TOOL_ROUND = [
+    {"role": "system", "content": "PERSONA" + "\n\nCurrent time: " + "now."},
+    {"role": "user", "content": "What is a context switch?"},
+    {"role": "assistant", "content": "I'll check your notes first.", "tool_calls": [
+        {"id": "t1", "type": "function", "function": {"name": "lecture_evidence", "arguments": "{\"query\": \"context switch\"}"}},
+        {"id": "t2", "type": "function", "function": {"name": "list_courses", "arguments": "{}"}},
+    ]},
+    {"role": "tool", "tool_call_id": "t1", "content": "{\"items\": []}"},
+    {"role": "tool", "tool_call_id": "t2", "content": "{\"courses\": [\"OS\"]}"},
+]
+
+
+def test_flattened_history_has_no_tool_blocks_and_labels_the_results():
+    from app import llm
+
+    out = llm._flatten_tool_history(TOOL_ROUND)
+
+    assert [m["role"] for m in out] == ["system", "user", "assistant", "user"]
+    assert not any(m.get("tool_calls") for m in out)
+    assert out[2] == {"role": "assistant", "content": "I'll check your notes first."}
+    results = out[3]["content"]
+    assert results.startswith(llm._FLAT_RESULTS_HEADER)
+    assert '<tool_result name="lecture_evidence" input="{\\"query\\": \\"context switch\\"}">\n{"items": []}\n</tool_result>' in results
+    assert results.index("lecture_evidence") < results.index("list_courses")
+    assert TOOL_ROUND[3]["role"] == "tool"
+
+
+def test_flattened_history_drops_a_silent_tool_call_turn():
+    from app import llm
+
+    silent = [dict(TOOL_ROUND[2], content=None) if i == 2 else m for i, m in enumerate(TOOL_ROUND)]
+    out = llm._flatten_tool_history(silent)
+    assert [m["role"] for m in out] == ["system", "user", "user"]
+
+
+def test_flattened_results_keep_the_cache_layout():
+    """The turn's context stays on the question, so every round reads the
+    earlier ones back, and the newest results carry the round breakpoint."""
+    from app import llm
+
+    out, _ = llm._apply_cache_breakpoint(llm._flatten_tool_history(TOOL_ROUND), None)
+    assert out[1]["content"][0] == {"type": "text", "text": "What is a context switch?", "cache_control": EPH}
+    assert out[1]["content"][1]["text"].startswith("<system-reminder>")
+    assert out[3]["content"][0]["cache_control"] == EPH
+
+
+def _sent_messages(monkeypatch, model, flag):
+    from app import config, llm
+
+    monkeypatch.setattr(config, "ANTHROPIC_FLAT_TOOL_HISTORY", flag)
+    sent = {}
+
+    async def fake_acompletion(**kwargs):
+        sent.update(kwargs)
+
+        async def empty():
+            return
+            yield
+
+        return empty()
+
+    monkeypatch.setattr(llm.litellm, "acompletion", fake_acompletion)
+
+    async def run():
+        async for _ in llm.astream(model, TOOL_ROUND, None, 100, 0.3):
+            pass
+
+    asyncio.run(run())
+    return sent["messages"]
+
+
+def test_claude_gets_text_history_only_when_switched_on(monkeypatch):
+    flat = _sent_messages(monkeypatch, "anthropic/claude-sonnet-5-5", True)
+    assert not any(m["role"] == "tool" for m in flat)
+    assert not any("_proteus_tool_results" in m for m in flat)
+
+    assert any(m["role"] == "tool" for m in _sent_messages(monkeypatch, "anthropic/claude-sonnet-5-5", False))
+    assert any(m["role"] == "tool" for m in _sent_messages(monkeypatch, "openrouter/openai/gpt-6-luna-pro", True))
