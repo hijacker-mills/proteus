@@ -966,3 +966,41 @@ def test_tools_without_a_query_or_payload_carry_no_data():
     ev = events.make_event("u1", "calculate", "ok", 1, {"expression": "6*7"}, {"result": 42})
     assert "data" not in ev
     assert "query" not in ev
+
+
+def test_lecture_evidence_event_passes_on_passage_times():
+    from app import events
+
+    result = {
+        "items": [
+            {"id": "S1", "noteId": "n1", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance",
+             "noteTitle": "Water balance", "segmentTitle": "Osmosis", "excerpt": "Water follows solute.",
+             "startSec": 845, "endSec": 870},
+            {"id": "S2", "noteId": "n2", "lectureId": "l8", "lectureTitle": "Lecture 8",
+             "noteTitle": "Renal", "excerpt": "ADH opens aquaporins.",
+             "startSec": 757, "endSec": 790, "timeApprox": True},
+            # A passage from the written note has no time and says so by omission.
+            {"id": "S3", "noteId": "n1", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance",
+             "noteTitle": "Water balance", "excerpt": "Summary."},
+        ],
+    }
+    ev = events.make_event("u1", "lecture_evidence", "ok", 400, {"query": "osmosis"}, result)
+
+    assert ev["data"]["passages"] == [
+        {"noteTitle": "Water balance", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance",
+         "segmentTitle": "Osmosis", "startSec": 845, "endSec": 870},
+        {"noteTitle": "Renal", "lectureId": "l8", "lectureTitle": "Lecture 8",
+         "startSec": 757, "endSec": 790, "timeApprox": True},
+        {"noteTitle": "Water balance", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance"},
+    ]
+    flat = repr(ev)
+    for private in ("excerpt", "Water follows", "aquaporins", "noteId", "n1"):
+        assert private not in flat
+
+
+def test_untimed_lecture_evidence_sends_no_passages():
+    from app import events
+
+    result = {"items": [{"id": "S1", "lectureId": "l6", "lectureTitle": "Lecture 6", "noteTitle": "Renal", "excerpt": "x"}]}
+    ev = events.make_event("u1", "lecture_evidence", "ok", 400, {"query": "renal"}, result)
+    assert "passages" not in ev["data"]
