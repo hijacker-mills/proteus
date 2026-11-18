@@ -127,7 +127,48 @@ def _evidence_lectures(result: dict[str, Any]) -> dict[str, Any] | None:
         items.append(entry)
         if len(items) >= 10:
             break
-    return {"items": items, "hits": len(raw)}
+    out: dict[str, Any] = {"items": items, "hits": len(raw)}
+    passages = _evidence_passages(raw)
+    if passages:
+        out["passages"] = passages
+    return out
+
+
+def _evidence_passages(raw: list[Any]) -> list[dict[str, Any]]:
+    """Where each passage sits in its recording, so a citation can play it.
+
+    The web route times transcript passages (exact for YouTube, `timeApprox`
+    when scaled across an uploaded recording). Every passage is listed, timed
+    or not, so the app can tell when a citation's note also had an untimed
+    passage and leave it without a time. Titles, sections and times only: no
+    excerpts or note ids. Empty when nothing was timed, so older web servers
+    change nothing here.
+    """
+    if not any(isinstance(i, dict) and isinstance(i.get("startSec"), (int, float)) for i in raw):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw[:10]:
+        if not isinstance(item, dict):
+            continue
+        note_title = item.get("noteTitle")
+        note_title = str(note_title).strip()[:120] if note_title else ""
+        if not note_title:
+            continue
+        entry: dict[str, Any] = {"noteTitle": note_title}
+        if item.get("lectureId"):
+            entry["lectureId"] = str(item["lectureId"])
+        if item.get("lectureTitle"):
+            entry["lectureTitle"] = str(item["lectureTitle"]).strip()[:120]
+        if item.get("segmentTitle"):
+            entry["segmentTitle"] = str(item["segmentTitle"]).strip()[:120]
+        start, end = item.get("startSec"), item.get("endSec")
+        if isinstance(start, (int, float)) and not isinstance(start, bool) and start >= 0:
+            entry["startSec"] = start
+            entry["endSec"] = end if isinstance(end, (int, float)) and not isinstance(end, bool) and end >= start else start
+            if item.get("timeApprox") is True:
+                entry["timeApprox"] = True
+        out.append(entry)
+    return out
 
 
 def make_event(
