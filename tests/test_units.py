@@ -891,3 +891,116 @@ def test_claude_gets_text_history_only_when_switched_on(monkeypatch):
 
     assert any(m["role"] == "tool" for m in _sent_messages(monkeypatch, "anthropic/claude-sonnet-5-5", False))
     assert any(m["role"] == "tool" for m in _sent_messages(monkeypatch, "openrouter/openai/gpt-6-luna-pro", True))
+
+
+# ── tool events ──────────────────────────────────────────────────────────────
+
+def test_lecture_evidence_event_lists_lectures_without_passages():
+    from app import events
+
+    result = {
+        "items": [
+            {"id": "S1", "noteId": "n1", "lectureId": "l6", "lectureTitle": "Lecture 6 · The kidney",
+             "noteTitle": "Renal physiology", "excerpt": "The loop of Henle concentrates urine."},
+            {"id": "S2", "noteId": "n2", "lectureId": "l6", "lectureTitle": "Lecture 6 · The kidney",
+             "noteTitle": "Renal physiology", "excerpt": "ADH opens aquaporins."},
+            {"id": "S3", "noteId": "n3", "lectureId": "l7", "lectureTitle": "Lecture 7 · Hormones",
+             "noteTitle": "Endocrine control", "excerpt": "Aldosterone retains sodium."},
+            # A passage whose lecture was deleted keeps its note title.
+            {"id": "S4", "noteId": None, "lectureId": None, "lectureTitle": None,
+             "noteTitle": "Loose notes", "excerpt": "Countercurrent exchange."},
+        ],
+        "meta": {"confidence": "strong"},
+    }
+    args = {"query": "countercurrent multiplier", "scope": "library"}
+    ev = events.make_event("u1", "lecture_evidence", "ok", 812.4, args, result)
+
+    # Existing fields are unchanged.
+    assert ev["tool"] == "lecture_evidence" and ev["status"] == "ok"
+    assert ev["query"] == "countercurrent multiplier"
+    assert ev["scope"] == "library"
+    assert ev["hits"] == 4
+
+    assert ev["data"]["items"] == [
+        {"lectureId": "l6", "title": "Lecture 6 · The kidney"},
+        {"lectureId": "l7", "title": "Lecture 7 · Hormones"},
+        {"title": "Loose notes"},
+    ]
+    assert ev["data"]["hits"] == 4
+    assert ev["data"]["query"] == ev["query"]
+    # No passages, note ids or excerpts reach the client.
+    flat = repr(ev)
+    for private in ("excerpt", "loop of Henle", "aquaporins", "noteId", "n1"):
+        assert private not in flat
+
+
+def test_empty_lecture_evidence_sends_an_empty_list():
+    from app import events
+
+    ev = events.make_event("u1", "lecture_evidence", "ok", 300, {"query": "ADH"}, {"items": [], "meta": {}})
+    assert ev["hits"] == 0
+    assert ev["data"] == {"items": [], "hits": 0, "query": "ADH"}
+
+
+def test_query_is_mirrored_into_data_on_every_status():
+    from app import events
+
+    started = events.make_event("u1", "web_search", "started", 0.0, {"query": "x" * 80})
+    assert started["query"] == "x" * 60
+    assert started["data"] == {"query": "x" * 60}
+
+    failed = events.make_event("u1", "lecture_evidence", "error", 50, {"query": "ADH"}, {"error": "boom"})
+    assert failed["error"] == "boom"
+    assert failed["data"] == {"query": "ADH"}
+
+    # A render payload keeps its own fields beside the query.
+    images = events.make_event("u1", "image_search", "ok", 90, {"query": "nephron"},
+                               {"images": [{"src": "https://example.com/n.png", "alt": "Nephron"}]})
+    assert images["data"]["images"][0]["src"] == "https://example.com/n.png"
+    assert images["data"]["query"] == "nephron"
+
+
+def test_tools_without_a_query_or_payload_carry_no_data():
+    from app import events
+
+    ev = events.make_event("u1", "calculate", "ok", 1, {"expression": "6*7"}, {"result": 42})
+    assert "data" not in ev
+    assert "query" not in ev
+
+
+def test_lecture_evidence_event_passes_on_passage_times():
+    from app import events
+
+    result = {
+        "items": [
+            {"id": "S1", "noteId": "n1", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance",
+             "noteTitle": "Water balance", "segmentTitle": "Osmosis", "excerpt": "Water follows solute.",
+             "startSec": 845, "endSec": 870},
+            {"id": "S2", "noteId": "n2", "lectureId": "l8", "lectureTitle": "Lecture 8",
+             "noteTitle": "Renal", "excerpt": "ADH opens aquaporins.",
+             "startSec": 757, "endSec": 790, "timeApprox": True},
+            # A passage from the written note has no time and says so by omission.
+            {"id": "S3", "noteId": "n1", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance",
+             "noteTitle": "Water balance", "excerpt": "Summary."},
+        ],
+    }
+    ev = events.make_event("u1", "lecture_evidence", "ok", 400, {"query": "osmosis"}, result)
+
+    assert ev["data"]["passages"] == [
+        {"noteTitle": "Water balance", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance",
+         "segmentTitle": "Osmosis", "startSec": 845, "endSec": 870},
+        {"noteTitle": "Renal", "lectureId": "l8", "lectureTitle": "Lecture 8",
+         "startSec": 757, "endSec": 790, "timeApprox": True},
+        {"noteTitle": "Water balance", "lectureId": "l7", "lectureTitle": "Lecture 7 · Water balance"},
+    ]
+    flat = repr(ev)
+    for private in ("excerpt", "Water follows", "aquaporins", "noteId", "n1"):
+        assert private not in flat
+
+
+def test_untimed_lecture_evidence_sends_no_passages():
+    from app import events
+
+    result = {"items": [{"id": "S1", "lectureId": "l6", "lectureTitle": "Lecture 6", "noteTitle": "Renal", "excerpt": "x"}]}
+    ev = events.make_event("u1", "lecture_evidence", "ok", 400, {"query": "renal"}, result)
+    assert "passages" not in ev["data"]

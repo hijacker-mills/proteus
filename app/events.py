@@ -25,11 +25,14 @@ def _render_payload(tool: str, result: Any) -> dict[str, Any] | None:
     Only tools whose entire output is meant to be shown wholesale opt in, so the
     frontend can render a card directly from real data instead of depending on the
     model to re-emit it as text markers. Kept tiny (SSE size + privacy): tools whose
-    useful output is the model's own prose (quiz_generate, lecture_evidence,
-    recall_grade, memory_*) are intentionally NOT included.
+    useful output is the model's own prose (quiz_generate, recall_grade, memory_*)
+    are intentionally NOT included. lecture_evidence sends only which lectures it
+    found, never the passages.
     """
     if not isinstance(result, dict):
         return None
+    if tool == "lecture_evidence":
+        return _evidence_lectures(result)
     if tool == "image_search":
         imgs = result.get("images")
         if not isinstance(imgs, list):
@@ -88,6 +91,86 @@ def _render_payload(tool: str, result: Any) -> dict[str, Any] | None:
     return None
 
 
+def _evidence_lectures(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The lectures a lecture_evidence search found, one entry each.
+
+    The app shows these as chips under "Found 3 passages in ..." and checks
+    them against the lecture the student has open. Titles and ids only: the
+    excerpts are the student's notes and stay between the tool and the model.
+
+    A passage whose lecture no longer resolves has no lectureId or
+    lectureTitle, so it is listed under its note title instead. That keeps the
+    list empty exactly when the search found nothing, which is what the app
+    reads `items` for. `hits` is the passage count, as on the event itself.
+    """
+    raw = result.get("items")
+    if not isinstance(raw, list):
+        return None
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        lecture_id = item.get("lectureId")
+        lecture_id = str(lecture_id) if lecture_id else None
+        title = item.get("lectureTitle") or item.get("noteTitle")
+        title = str(title).strip()[:120] if title else ""
+        if not lecture_id and not title:
+            continue
+        key = f"id:{lecture_id}" if lecture_id else f"title:{title}"
+        if key in seen:
+            continue
+        seen.add(key)
+        entry: dict[str, str] = {"title": title}
+        if lecture_id:
+            entry["lectureId"] = lecture_id
+        items.append(entry)
+        if len(items) >= 10:
+            break
+    out: dict[str, Any] = {"items": items, "hits": len(raw)}
+    passages = _evidence_passages(raw)
+    if passages:
+        out["passages"] = passages
+    return out
+
+
+def _evidence_passages(raw: list[Any]) -> list[dict[str, Any]]:
+    """Where each passage sits in its recording, so a citation can play it.
+
+    The web route times transcript passages (exact for YouTube, `timeApprox`
+    when scaled across an uploaded recording). Every passage is listed, timed
+    or not, so the app can tell when a citation's note also had an untimed
+    passage and leave it without a time. Titles, sections and times only: no
+    excerpts or note ids. Empty when nothing was timed, so older web servers
+    change nothing here.
+    """
+    if not any(isinstance(i, dict) and isinstance(i.get("startSec"), (int, float)) for i in raw):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw[:10]:
+        if not isinstance(item, dict):
+            continue
+        note_title = item.get("noteTitle")
+        note_title = str(note_title).strip()[:120] if note_title else ""
+        if not note_title:
+            continue
+        entry: dict[str, Any] = {"noteTitle": note_title}
+        if item.get("lectureId"):
+            entry["lectureId"] = str(item["lectureId"])
+        if item.get("lectureTitle"):
+            entry["lectureTitle"] = str(item["lectureTitle"]).strip()[:120]
+        if item.get("segmentTitle"):
+            entry["segmentTitle"] = str(item["segmentTitle"]).strip()[:120]
+        start, end = item.get("startSec"), item.get("endSec")
+        if isinstance(start, (int, float)) and not isinstance(start, bool) and start >= 0:
+            entry["startSec"] = start
+            entry["endSec"] = end if isinstance(end, (int, float)) and not isinstance(end, bool) and end >= start else start
+            if item.get("timeApprox") is True:
+                entry["timeApprox"] = True
+        out.append(entry)
+    return out
+
+
 def make_event(
     user_id: str,
     tool: str,
@@ -124,12 +207,19 @@ def make_event(
                     break
 
     # Structured render payload for tools with a frontend card (image_search,
-    # youtube_fetch). Rides along on the same `proteus_tool_event` chunk;
-    # telemetry fields above are unchanged, so existing consumers keep working.
+    # youtube_fetch, the lectures lecture_evidence found). Rides along on the
+    # same `proteus_tool_event` chunk; telemetry fields above are unchanged, so
+    # existing consumers keep working.
+    data: dict[str, Any] = {}
     if status == "ok":
-        data = _render_payload(tool, result)
-        if data is not None:
-            ev["data"] = data
+        data.update(_render_payload(tool, result) or {})
+    # The query also goes in `data`, on every status, because the app's
+    # activity row reads the subject ("Searching your notes for ...") from
+    # there. The top-level `query` stays for older readers.
+    if "query" in ev:
+        data["query"] = ev["query"]
+    if data:
+        ev["data"] = data
     return ev
 
 
